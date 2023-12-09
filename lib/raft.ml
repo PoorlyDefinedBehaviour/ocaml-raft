@@ -1,7 +1,7 @@
 type replica_id = int [@@deriving show, eq]
 type term = int64 [@@deriving show, eq]
 
-type persistante_state = {
+type persistant_state = {
   (* The latest term the server has seen. Initialized to 0 on first boot. Monotonically increasing.   *)
   mutable current_term : int64;
   (* Replica that received the vote in the current term *)
@@ -22,7 +22,7 @@ type volatile_state = {
 [@@deriving show, eq]
 
 type replica = {
-  persistante_state : persistante_state;
+  persistant_state : persistant_state;
   volatile_state : volatile_state;
 }
 [@@deriving show, eq]
@@ -58,14 +58,14 @@ type storage = {
   initial_state : unit -> initial_state;
   last_log_term : unit -> term;
   last_log_index : unit -> int64;
-  persist : persistante_state -> unit;
+  persist : persistant_state -> unit;
 }
 
 (* type deps = { storage : storage } *)
 
 let create () : replica =
   {
-    persistante_state =
+    persistant_state =
       {
         (* TODO: get from disk *)
         current_term = 0L;
@@ -78,29 +78,29 @@ let create () : replica =
 
 let has_voted_for_other_candidate (replica : replica)
     (candidate_id : replica_id) : bool =
-  match replica.persistante_state.voted_for with
+  match replica.persistant_state.voted_for with
   | None -> false
   | Some replica_id -> replica_id != candidate_id
 
 let handle_request_vote (storage : storage) (replica : replica)
     (message : request_vote_input) : request_vote_output =
-  if message.term > replica.persistante_state.current_term then (
-    replica.persistante_state.current_term <- message.term;
+  if message.term > replica.persistant_state.current_term then (
+    replica.persistant_state.current_term <- message.term;
     replica.volatile_state.state <- Follower);
 
   let response =
     if
-      message.term < replica.persistante_state.current_term
+      message.term < replica.persistant_state.current_term
       || has_voted_for_other_candidate replica message.candidate_id
       || message.last_log_term < storage.last_log_term ()
       || message.last_log_index < storage.last_log_index ()
-    then { term = replica.persistante_state.current_term; vote_granted = false }
+    then { term = replica.persistant_state.current_term; vote_granted = false }
     else (
-      replica.persistante_state.current_term <- message.term;
-      replica.persistante_state.voted_for <- Some message.candidate_id;
-      { term = replica.persistante_state.current_term; vote_granted = true })
+      replica.persistant_state.current_term <- message.term;
+      replica.persistant_state.voted_for <- Some message.candidate_id;
+      { term = replica.persistant_state.current_term; vote_granted = true })
   in
-  storage.persist replica.persistante_state;
+  storage.persist replica.persistant_state;
   response
 
 let%test_unit "request vote: replica receives a term greater than its own -> \
@@ -115,7 +115,7 @@ let%test_unit "request vote: replica receives a term greater than its own -> \
   in
   let replica = create () in
   replica.volatile_state.state <- Candidate;
-  replica.persistante_state.current_term <- 1L;
+  replica.persistant_state.current_term <- 1L;
 
   let input =
     { term = 2L; candidate_id = 1; last_log_index = 1L; last_log_term = 1L }
@@ -124,7 +124,7 @@ let%test_unit "request vote: replica receives a term greater than its own -> \
   let actual = handle_request_vote storage replica input in
 
   assert (replica.volatile_state.state = Follower);
-  assert (replica.persistante_state.current_term = 2L);
+  assert (replica.persistant_state.current_term = 2L);
   assert (actual = expected)
 
 let%test_unit "request vote: candidate term is not up to date -> do not grant \
@@ -138,7 +138,7 @@ let%test_unit "request vote: candidate term is not up to date -> do not grant \
     }
   in
   let replica = create () in
-  replica.persistante_state.current_term <- 1L;
+  replica.persistant_state.current_term <- 1L;
 
   let input =
     { term = 0L; candidate_id = 1; last_log_index = 0L; last_log_term = 0L }
@@ -159,7 +159,7 @@ let%test_unit "request vote: replica voted for someone else -> do not grant \
   in
   let replica = create () in
 
-  replica.persistante_state.voted_for <- Some 10;
+  replica.persistant_state.voted_for <- Some 10;
 
   let input =
     { term = 0L; candidate_id = 1; last_log_index = 0L; last_log_term = 0L }

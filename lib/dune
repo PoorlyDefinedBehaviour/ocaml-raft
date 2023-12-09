@@ -1,0 +1,15 @@
+(library
+ (name raft)
+ (inline_tests)
+ (preprocess
+  (pps
+   ppx_inline_test
+   ppx_assert
+   ppx_deriving.show
+   ppx_deriving.ord
+   ppx_deriving.eq)))
+
+(env
+ (dev
+  (flags
+   (:standard -warn-error -A))))

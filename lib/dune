@@ -7,7 +7,8 @@
    ppx_assert
    ppx_deriving.show
    ppx_deriving.ord
-   ppx_deriving.eq)))
+   ppx_deriving.eq))
+ (libraries uuidm core_unix checkseum))
 
 (env
  (dev

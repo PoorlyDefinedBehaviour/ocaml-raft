@@ -43,9 +43,6 @@ let handle_request_vote (storage : storage) (replica : replica)
     replica.persistent_state.current_term <- message.term;
     replica.volatile_state.state <- Follower);
 
-  (* TODO: handle case where message.last_log_index > last log index *)
-  (* TODO: handle case where message.last_log_term > last log term *)
-  assert false
   let response : request_vote_output =
     if
       message.term < replica.persistent_state.current_term
@@ -81,8 +78,9 @@ let%test_unit "request vote: replica receives message with higher term -> \
   in
   let expected = { term = 1L; vote_granted = true } in
   assert (expected = actual);
-  (* TODO: check that replica updated term and reset voted for *)
-  assert false;
+
+  assert (replica.persistent_state.voted_for = Some 1);
+  assert (replica.persistent_state.current_term = 1L);
   assert (replica.volatile_state.state = Follower)
 
 let%test_unit "request vote: replica receives a term greater than its own -> \

@@ -64,6 +64,7 @@ let create (config : config) : t =
       Out_channel.open_gen
         [ Out_channel.Open_creat; Out_channel.Open_append ]
         0o777 log_file_path;
+    (* TODO: call last_log_entry *)
     last_log_term = 0L;
     last_log_index = 0L;
   }
@@ -132,6 +133,28 @@ let read_entry (in_chan : in_channel) : Protocol.entry option =
       assert (header.data_checksum = Optint.to_int32 (checksum_of_string data));
 
       Some { term = header.term; data }
+
+(* Returns the entry at [index]. *)
+let entry_at_index (storage : t) (index : int64) : Protocol.entry option =
+  assert (index > 0L);
+
+  if index > storage.last_log_index then None
+  else
+    (* -1 because the first index is 1 but the first entry is at offset 0 in the file. *)
+    let entry_starts_at = Int64.mul (Int64.sub index 1L) page_size_in_bytes in
+
+    (* Store the current offset. *)
+    let position = pos_in storage.log_file_in in
+
+    (* Seek to the first byte of the entry. *)
+    seek_in storage.log_file_in (Int64.to_int entry_starts_at);
+
+    let entry = read_entry storage.log_file_in in
+
+    (* Move the offset to where it was before. *)
+    seek_in storage.log_file_in position;
+
+    entry
 
 (* Writes [entry] to [out_chan]. Does not flush [out_chan]. *)
 let write_entry (out_chan : out_channel) (entry : Protocol.entry) : unit =

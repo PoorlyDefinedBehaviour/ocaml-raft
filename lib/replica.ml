@@ -4,12 +4,17 @@ type storage = {
   initial_state : unit -> initial_state;
   last_log_term : unit -> term;
   last_log_index : unit -> int64;
+  entry_at_index : int64 -> entry option;
   persist : persistent_state -> unit;
 }
 [@@deriving show]
 
 type transport = {
+  (* Sends a request vote response to the replica. *)
   send_request_vote_output : replica_id -> request_vote_output -> unit;
+  (* Sends a append entries response to the replica. *)
+  send_append_entries_output :
+    replica_id -> Protocol.append_entries_output -> unit;
 }
 [@@deriving show]
 
@@ -43,8 +48,6 @@ type output_message =
   | RequestVote of Protocol.request_vote_output
   | AppendEntries of Protocol.append_entries_output
 [@@deriving show]
-
-(* type deps = { storage : storage } *)
 
 let create ~(transport : transport) ~(storage : storage)
     ~(initial_state : initial_state) : replica =
@@ -88,15 +91,41 @@ let handle_request_vote (storage : storage) (replica : replica)
   storage.persist replica.persistent_state;
   response
 
-let handle_append_entries (storage : storage) (replica : replica)
-    (message : append_entries_input) : append_entries_output =
+(* TODO: test *)
+let handle_append_entries (replica : replica) (message : append_entries_input) :
+    append_entries_output =
   if message.leader_term > replica.persistent_state.current_term then (
     replica.persistent_state.current_term <- message.leader_term;
     replica.volatile_state.state <- Follower);
 
   if message.leader_term < replica.persistent_state.current_term then
-    { term = replica.persistent_state.current_term; success = false }
-  else assert false
+    {
+      term = replica.persistent_state.current_term;
+      success = false;
+      last_log_index = replica.storage.last_log_index ();
+    }
+  else
+    (* TODO: handle case where previous_log_index is 0. *)
+    match replica.storage.entry_at_index message.previous_log_index with
+    (* Replica doesn't have entry at this index. *)
+    | None ->
+        {
+          term = replica.persistent_state.current_term;
+          success = false;
+          last_log_index = replica.storage.last_log_index ();
+        }
+    | Some entry ->
+        if entry.term != message.previous_log_term then
+          assert (* truncate *)
+                 false;
+
+        (* append *)
+        (* commit *)
+        {
+          term = replica.persistent_state.current_term;
+          success = true;
+          last_log_index = replica.storage.last_log_index ();
+        }
 
 let handle_message (replica : replica) (input_message : input_message) =
   match input_message with
@@ -107,7 +136,11 @@ let handle_message (replica : replica) (input_message : input_message) =
       replica.transport.send_request_vote_output
         (replica_id_of_input_message input_message)
         output_message
-  | AppendEntries message -> assert false
+  | AppendEntries message ->
+      let output_message = handle_append_entries replica message in
+      replica.transport.send_append_entries_output
+        (replica_id_of_input_message input_message)
+        output_message
 
 (* Returns a Disk_storage instance which writes to a temp folder. *)
 let test_disk_storage () : storage =
@@ -116,12 +149,19 @@ let test_disk_storage () : storage =
     initial_state = (fun () -> Disk_storage.initial_state disk_storage);
     last_log_term = (fun () -> Disk_storage.last_log_term disk_storage);
     last_log_index = (fun () -> Disk_storage.last_log_index disk_storage);
+    entry_at_index =
+      (fun index -> Disk_storage.entry_at_index disk_storage index);
     persist = Disk_storage.persist disk_storage;
   }
 
 (* Returns a replica that can be used in tests. *)
 let test_replica (initial_state : Protocol.initial_state) : replica =
-  let noop_transport = { send_request_vote_output = (fun _ _ -> ()) } in
+  let noop_transport =
+    {
+      send_request_vote_output = (fun _ _ -> ());
+      send_append_entries_output = (fun _ _ -> ());
+    }
+  in
   create ~transport:noop_transport ~storage:(test_disk_storage ())
     ~initial_state
 
@@ -147,6 +187,7 @@ let%test_unit "request vote: replica receives a term greater than its own -> \
       last_log_term = (fun () -> 1L);
       last_log_index = (fun () -> 1L);
       persist = (fun _ -> ());
+      entry_at_index = (fun _ -> None);
     }
   in
   let replica = test_replica { current_term = 1L; voted_for = None } in
@@ -170,6 +211,7 @@ let%test_unit "request vote: candidate term is not up to date -> do not grant \
       last_log_term = (fun () -> assert false);
       last_log_index = (fun () -> assert false);
       persist = (fun _ -> ());
+      entry_at_index = (fun _ -> None);
     }
   in
   let replica = test_replica { current_term = 1L; voted_for = None } in
@@ -189,6 +231,7 @@ let%test_unit "request vote: replica voted for someone else -> do not grant \
       last_log_term = (fun () -> 0L);
       last_log_index = (fun () -> 0L);
       persist = (fun _ -> ());
+      entry_at_index = (fun _ -> None);
     }
   in
   let replica = test_replica { current_term = 0L; voted_for = Some 10 } in
@@ -209,6 +252,7 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
       last_log_term = (fun () -> 2L);
       last_log_index = (fun () -> 3L);
       persist = (fun _ -> ());
+      entry_at_index = (fun _ -> None);
     }
   in
   let replica = test_replica { current_term = 2L; voted_for = None } in
@@ -229,6 +273,7 @@ let%test_unit "request vote: same last log term but replica's last log index \
       last_log_term = (fun () -> 2L);
       last_log_index = (fun () -> 5L);
       persist = (fun _ -> ());
+      entry_at_index = (fun _ -> None);
     }
   in
   let replica = test_replica { current_term = 2L; voted_for = None } in
@@ -259,10 +304,9 @@ let%test_unit "request vote: replica persists decision to storage" =
   assert (replica.persistent_state.voted_for = Some 5)
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
-  let storage = test_disk_storage () in
   let replica = test_replica { current_term = 1L; voted_for = None } in
   let actual =
-    handle_append_entries storage replica
+    handle_append_entries replica
       {
         leader_term = 0L;
         leader_id = 1;
@@ -272,4 +316,4 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
         leader_commit = 0L;
       }
   in
-  assert (actual = { term = 1L; success = false })
+  assert (actual = { term = 1L; success = false; last_log_index = 0L })

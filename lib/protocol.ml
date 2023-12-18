@@ -1,5 +1,5 @@
-type replica_id = int [@@deriving show, eq]
-type term = int64 [@@deriving show, eq]
+type replica_id = int [@@deriving show]
+type term = int64 [@@deriving show]
 
 type persistent_state = {
   (* The latest term the server has seen. Initialized to 0 on first boot. Monotonically increasing.   *)
@@ -7,9 +7,9 @@ type persistent_state = {
   (* Replica that received the vote in the current term *)
   mutable voted_for : replica_id option;
 }
-[@@deriving show, eq]
+[@@deriving show]
 
-type state = Follower | Candidate | Leader [@@deriving show, eq]
+type state = Follower | Candidate | Leader [@@deriving show]
 
 type volatile_state = {
   (* If the replica is a leader/candidate/follower *)
@@ -19,7 +19,7 @@ type volatile_state = {
   (* Index of the highest log entry applied to the state machine. Initialized to 0. Monotonically increasing. *)
   mutable last_applied_index : int64;
 }
-[@@deriving show, eq]
+[@@deriving show]
 
 type request_vote_input = {
   (* Candidate's term *)
@@ -31,10 +31,10 @@ type request_vote_input = {
   (* Term of candidate's last log entry *)
   last_log_term : term;
 }
-[@@deriving show, eq]
+[@@deriving show]
 
 type initial_state = { current_term : term; voted_for : replica_id option }
-[@@deriving show, eq]
+[@@deriving show]
 
 type request_vote_output = {
   (* The current term in the replica that received the request vote request *)
@@ -42,9 +42,9 @@ type request_vote_output = {
   (* True means candidate received vote *)
   vote_granted : bool;
 }
-[@@deriving show, eq]
+[@@deriving show]
 
-type entry = { term : term; data : string } [@@deriving show, eq]
+type entry = { term : term; data : string } [@@deriving show]
 
 type append_entries_input = {
   (* Leader's term *)
@@ -60,7 +60,7 @@ type append_entries_input = {
   (* Leader's commit index *)
   leader_commit : int64;
 }
-[@@deriving show, eq]
+[@@deriving show]
 
 type append_entries_output = {
   (* The current term in the replica, for leader to update itself *)
@@ -68,4 +68,4 @@ type append_entries_output = {
   (* True if follower contained entry matching previous_log_index and previous_log_term *)
   success : bool;
 }
-[@@deriving show, eq]
+[@@deriving show]

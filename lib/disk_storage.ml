@@ -45,7 +45,7 @@ let create (config : config) : t =
 
   let state_file_pathj = Printf.sprintf "%s/%s" config.dir state_file_name in
 
-  let log_file_path = Printf.sprintf "%s/0.%s" config.dir log_file_extension in
+  let log_file_path = Printf.sprintf "%s/0%s" config.dir log_file_extension in
 
   {
     state_file_in =
@@ -143,18 +143,11 @@ let entry_at_index (storage : t) (index : int64) : Protocol.entry option =
     (* -1 because the first index is 1 but the first entry is at offset 0 in the file. *)
     let entry_starts_at = Int64.mul (Int64.sub index 1L) page_size_in_bytes in
 
-    (* Store the current offset. *)
-    let position = pos_in storage.log_file_in in
-
     (* Seek to the first byte of the entry. *)
     seek_in storage.log_file_in (Int64.to_int entry_starts_at);
 
-    let entry = read_entry storage.log_file_in in
-
-    (* Move the offset to where it was before. *)
-    seek_in storage.log_file_in position;
-
-    entry
+    (* Read the entry at the offset. *)
+    read_entry storage.log_file_in
 
 (* Writes [entry] to [out_chan]. Does not flush [out_chan]. *)
 let write_entry (out_chan : out_channel) (entry : Protocol.entry) : unit =
@@ -168,14 +161,21 @@ let write_entry (out_chan : out_channel) (entry : Protocol.entry) : unit =
 
   let header_checksum = checksum_of_header header in
 
-  let buffer = Buffer.create 0 in
+  let buffer = Buffer.create (Int64.to_int page_size_in_bytes) in
+
   Buffer.add_int32_be buffer (Optint.to_int32 header_checksum);
   Buffer.add_int64_be buffer header.term;
   Buffer.add_int64_be buffer header.data_len;
   Buffer.add_int32_be buffer header.data_checksum;
   Buffer.add_string buffer entry.data;
 
-  Out_channel.output_bytes out_chan (Buffer.to_bytes buffer)
+  (* Fill the buffer with '0' to make sure it fills the page. *)
+  Buffer.add_bytes buffer
+    (Bytes.init
+       (Int64.to_int page_size_in_bytes - Buffer.length buffer)
+       (fun _ -> '0'));
+
+  Buffer.output_buffer out_chan buffer
 
 (* Does the actual iteration over the entries in [file]. *)
 let rec do_iter ~(f : Protocol.entry -> unit) (file : in_channel) : unit =
@@ -204,9 +204,14 @@ let append_entries (storage : t) (entries : Protocol.entry list) : unit =
   let new_entries_start_at_offset =
     Int64.mul storage.last_log_index page_size_in_bytes
   in
+  Printf.printf "append_entries: new_entries_start_at_offset=%Ld\n"
+    new_entries_start_at_offset;
 
   (* Move the pointer just after the latest entry that was successfully stored.  *)
   seek_out storage.log_file_out (Int64.to_int new_entries_start_at_offset);
+
+  Printf.printf "append_entries: will write to pos %Ld\n"
+    (Out_channel.pos storage.log_file_out);
 
   List.iter (fun entry -> write_entry storage.log_file_out entry) entries;
 
@@ -271,6 +276,20 @@ let%test_unit "persist: stores persistent state on disk" =
   let state = initial_state storage in
 
   assert (expected = state)
+
+let truncate (storage : t) (index : int64) : unit =
+  Printf.printf "truncate: called index=%Ld\n" index;
+  let entry_ends_at = Int64.mul index page_size_in_bytes in
+
+  let file_descr = Unix.descr_of_out_channel storage.log_file_out in
+  Printf.printf "truncate: entry_ends_at=%d\n" (Int64.to_int entry_ends_at);
+  Unix.ftruncate file_descr (Int64.to_int entry_ends_at);
+  Unix.fsync file_descr;
+
+  Out_channel.seek storage.log_file_out entry_ends_at;
+  In_channel.seek storage.log_file_in entry_ends_at;
+
+  storage.last_log_index <- index
 
 let%test_unit "last_log_term: returns the term of the last log entry" =
   (* Given an empty log *)
@@ -339,3 +358,63 @@ let%test_unit "initial_state: returns the stored state (there's a file on disk)"
   (* Reopen the file just to be sure it doesn't get truncated. *)
   let storage = create { dir } in
   assert (initial_state storage = { current_term = 1L; voted_for = Some 1 })
+
+let%test_unit "entry_at_index: returns the entry at the index" =
+  let dir = Test_util.temp_dir () in
+
+  let storage = create { dir } in
+
+  (* Log is empty *)
+  assert (entry_at_index storage 1L = None);
+
+  (* Append an entry to the log. *)
+  append_entries storage [ { term = 1L; data = "1" } ];
+
+  (* Should be able to get the entry we just appended. *)
+  assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
+
+  (* Append another entry to the log. *)
+  append_entries storage [ { term = 1L; data = "2" } ];
+
+  (* Should be able to get the entry we just appended and the previous entry. *)
+  assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
+  assert (entry_at_index storage 2L = Some { term = 1L; data = "2" });
+  assert (entry_at_index storage 3L = None)
+
+let%test_unit "truncate: truncates the log to index" =
+  let dir = Test_util.temp_dir () in
+
+  let storage = create { dir } in
+
+  (* Log is empty *)
+  assert (entry_at_index storage 1L = None);
+
+  (* Append an entry to the log. *)
+  append_entries storage
+    [
+      { term = 1L; data = "1" };
+      { term = 1L; data = "2" };
+      { term = 2L; data = "3" };
+    ];
+
+  (* Get the entries that were just appended. *)
+  assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
+  assert (entry_at_index storage 2L = Some { term = 1L; data = "2" });
+  assert (entry_at_index storage 3L = Some { term = 2L; data = "3" });
+
+  (* Truncate the log. Remove entries after index 1. *)
+  truncate storage 1L;
+
+  (* The entries after index 1 should not be in the log anymore. *)
+  assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
+  assert (entry_at_index storage 2L = None);
+  assert (entry_at_index storage 3L = None);
+
+  (* Append the entries again. They should go to the end of the log. *)
+  append_entries storage
+    [ { term = 1L; data = "2" }; { term = 2L; data = "3" } ];
+
+  (* Ensure the entries have been appended and we can read them. *)
+  assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
+  assert (entry_at_index storage 2L = Some { term = 1L; data = "2" });
+  assert (entry_at_index storage 3L = Some { term = 2L; data = "3" })

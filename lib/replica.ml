@@ -77,7 +77,7 @@ let has_voted_for_other_candidate (replica : replica)
     (candidate_id : replica_id) : bool =
   match replica.persistent_state.voted_for with
   | None -> false
-  | Some replica_id -> replica_id != candidate_id
+  | Some replica_id -> replica_id <> candidate_id
 
 (* TODO: reset election timeout when vote is granted *)
 let handle_request_vote (storage : storage) (replica : replica)
@@ -122,22 +122,33 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       last_log_index = replica.storage.last_log_index ();
     }
   else (
+    (* TOOD: handle case where previous_log_index = 0 but last_log_index() is not 0 *)
     (if message.previous_log_index > 0L then
        let entry =
          Option.get (replica.storage.entry_at_index message.previous_log_index)
        in
 
+       (* TODO: should we check every new entry for conflicts? *)
        (* Truncate log if leader the log in this replica does not match the leader's log. *)
-       if entry.term != message.previous_log_term then
+       if entry.term <> message.previous_log_term then (
          (* Truncate to the entry before the starting log index in the message. *)
-         replica.storage.truncate (Int64.sub 1L message.previous_log_index));
+         Printf.printf
+           "before truncate call: previous_log_index=%Ld truncate_index=%Ld \
+            entry=%s previous_log_term=%Ld entry.term=%Ld\n"
+           message.previous_log_index
+           (Int64.sub message.previous_log_index 1L)
+           (show_entry entry) message.previous_log_term entry.term;
+         replica.storage.truncate (Int64.sub message.previous_log_index 1L)));
 
     (* Append new entries to the log. *)
     replica.storage.append_entries message.entries;
 
-    (* Update the latest known committed index because the leader may have committed some entries. *)
+    (* Update the latest known committed index because the leader may have committed some entries.
+       The commit index is the minimum between the leader commit index and the last log entry index
+       because the leader may have committed up to index 5 and have sent just 3 entries so far for example.
+    *)
     replica.volatile_state.commit_index <-
-      Int64.max replica.volatile_state.commit_index message.leader_commit;
+      Int64.min message.leader_commit (replica.storage.last_log_index ());
 
     (* If there are entries to commit, commit them. *)
     if
@@ -412,6 +423,40 @@ let%test_unit "append entries: log entry at index does not match \
 
   assert (actual = { term = 1L; success = true; last_log_index = 1L });
 
+  (* The log should have been truncated which means the entry at index 1 is the new entry. *)
   assert (
     replica.storage.entry_at_index 1L
     = Some { term = 1L; data = "hello world 2" })
+
+let%test_unit "append entries: leader commit index > replica commit index, \
+               should update commit index" =
+  (* Replica with empty log. Last log index is 0. *)
+  let replica = test_replica { current_term = 0L; voted_for = None } in
+
+  (* Append some entries to the log. *)
+  assert (
+    handle_append_entries replica
+      {
+        leader_term = 1L;
+        leader_id = 1;
+        previous_log_index = 0L;
+        previous_log_term = 0L;
+        entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
+        leader_commit = 0L;
+      }
+    = { term = 1L; success = true; last_log_index = 2L });
+
+  (* Leader has commited entries up to index 2. *)
+  assert (
+    handle_append_entries replica
+      {
+        leader_term = 1L;
+        leader_id = 1;
+        previous_log_index = 2L;
+        previous_log_term = 1L;
+        entries = [ { term = 1L; data = "3" } ];
+        leader_commit = 2L;
+      }
+    = { term = 1L; success = true; last_log_index = 3L })
+
+(* There's 3 entries in the log. Two of them are commited. Should apply the commited entries to the state machine. *)

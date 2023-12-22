@@ -128,10 +128,9 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
        in
 
        (* Truncate log if leader the log in this replica does not match the leader's log. *)
-       if entry.term != message.previous_log_term then (
-         print_endline "will call storage.truncate";
+       if entry.term != message.previous_log_term then
          (* Truncate to the entry before the starting log index in the message. *)
-         replica.storage.truncate (Int64.sub 1L message.previous_log_index)));
+         replica.storage.truncate (Int64.sub 1L message.previous_log_index));
 
     (* Append new entries to the log. *)
     replica.storage.append_entries message.entries;
@@ -413,9 +412,6 @@ let%test_unit "append entries: log entry at index does not match \
 
   assert (actual = { term = 1L; success = true; last_log_index = 1L });
 
-  (match replica.storage.entry_at_index 1L with
-  | None -> print_endline "got none"
-  | Some v -> Printf.printf "entry=%s\n" (show_entry v));
   assert (
     replica.storage.entry_at_index 1L
     = Some { term = 1L; data = "hello world 2" })

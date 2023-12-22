@@ -4,7 +4,7 @@ type t = {
   (* Used to write to the file that has the persistent state. *)
   state_file_out : out_channel;
   (* Used to read from the file that has the log entries. *)
-  log_file_in : in_channel;
+  log_file_in : Unix.file_descr;
   (* Used to write to the file that has the log entries. *)
   log_file_out : out_channel;
   (* The term of the last log entry. *)
@@ -57,9 +57,7 @@ let create (config : config) : t =
         [ Out_channel.Open_creat; Out_channel.Open_append ]
         0o777 state_file_pathj;
     log_file_in =
-      In_channel.open_gen
-        [ In_channel.Open_creat; In_channel.Open_rdonly ]
-        0o777 log_file_path;
+      Unix.openfile log_file_path [ Unix.O_CREAT; Unix.O_RDONLY ] 0o777;
     log_file_out =
       Out_channel.open_gen
         [ Out_channel.Open_creat; Out_channel.Open_append ]
@@ -144,10 +142,14 @@ let entry_at_index (storage : t) (index : int64) : Protocol.entry option =
     let entry_starts_at = Int64.mul (Int64.sub index 1L) page_size_in_bytes in
 
     (* Seek to the first byte of the entry. *)
-    seek_in storage.log_file_in (Int64.to_int entry_starts_at);
+    let _ =
+      Unix.lseek storage.log_file_in
+        (Int64.to_int entry_starts_at)
+        Unix.SEEK_SET
+    in
 
     (* Read the entry at the offset. *)
-    read_entry storage.log_file_in
+    read_entry (Unix.in_channel_of_descr storage.log_file_in)
 
 (* Writes [entry] to [out_chan]. Does not flush [out_chan]. *)
 let write_entry (out_chan : out_channel) (entry : Protocol.entry) : unit =
@@ -204,14 +206,9 @@ let append_entries (storage : t) (entries : Protocol.entry list) : unit =
   let new_entries_start_at_offset =
     Int64.mul storage.last_log_index page_size_in_bytes
   in
-  Printf.printf "append_entries: new_entries_start_at_offset=%Ld\n"
-    new_entries_start_at_offset;
 
   (* Move the pointer just after the latest entry that was successfully stored.  *)
   seek_out storage.log_file_out (Int64.to_int new_entries_start_at_offset);
-
-  Printf.printf "append_entries: will write to pos %Ld\n"
-    (Out_channel.pos storage.log_file_out);
 
   List.iter (fun entry -> write_entry storage.log_file_out entry) entries;
 
@@ -278,16 +275,12 @@ let%test_unit "persist: stores persistent state on disk" =
   assert (expected = state)
 
 let truncate (storage : t) (index : int64) : unit =
-  Printf.printf "truncate: called index=%Ld\n" index;
   let entry_ends_at = Int64.mul index page_size_in_bytes in
 
   let file_descr = Unix.descr_of_out_channel storage.log_file_out in
-  Printf.printf "truncate: entry_ends_at=%d\n" (Int64.to_int entry_ends_at);
+
   Unix.ftruncate file_descr (Int64.to_int entry_ends_at);
   Unix.fsync file_descr;
-
-  Out_channel.seek storage.log_file_out entry_ends_at;
-  In_channel.seek storage.log_file_in entry_ends_at;
 
   storage.last_log_index <- index
 
@@ -382,9 +375,7 @@ let%test_unit "entry_at_index: returns the entry at the index" =
   assert (entry_at_index storage 3L = None)
 
 let%test_unit "truncate: truncates the log to index" =
-  let dir = Test_util.temp_dir () in
-
-  let storage = create { dir } in
+  let storage = create { dir = Test_util.temp_dir () } in
 
   (* Log is empty *)
   assert (entry_at_index storage 1L = None);
@@ -417,4 +408,11 @@ let%test_unit "truncate: truncates the log to index" =
   (* Ensure the entries have been appended and we can read them. *)
   assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
   assert (entry_at_index storage 2L = Some { term = 1L; data = "2" });
-  assert (entry_at_index storage 3L = Some { term = 2L; data = "3" })
+  assert (entry_at_index storage 3L = Some { term = 2L; data = "3" });
+
+  (* Empty the log. *)
+  truncate storage 0L;
+
+  assert (entry_at_index storage 1L = None);
+  assert (entry_at_index storage 2L = None);
+  assert (entry_at_index storage 3L = None)

@@ -131,6 +131,7 @@ let commit (replica : replica) : unit =
   | Break -> ()
   | exn -> raise exn
 
+(* TODO: reset election timer *)
 let handle_append_entries (replica : replica) (message : append_entries_input) :
     append_entries_output =
   if message.leader_term > replica.persistent_state.current_term then (

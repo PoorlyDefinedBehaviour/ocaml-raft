@@ -33,6 +33,8 @@ type replica = {
   volatile_state : volatile_state;
   storage : storage;
   transport : transport;
+  (* Function called to apply an entry to the state machine. *)
+  fsm_apply : Protocol.entry -> unit;
 }
 [@@deriving show]
 
@@ -60,7 +62,8 @@ type output_message =
 [@@deriving show]
 
 let create ~(transport : transport) ~(storage : storage)
-    ~(initial_state : initial_state) : replica =
+    ~(initial_state : initial_state) ~(fsm_apply : Protocol.entry -> unit) :
+    replica =
   {
     persistent_state =
       {
@@ -71,6 +74,7 @@ let create ~(transport : transport) ~(storage : storage)
       { state = Follower; commit_index = 0L; last_applied_index = 0L };
     storage;
     transport;
+    fsm_apply;
   }
 
 let has_voted_for_other_candidate (replica : replica)
@@ -101,9 +105,28 @@ let handle_request_vote (storage : storage) (replica : replica)
   storage.persist replica.persistent_state;
   response
 
+(* Applies unapplied entries to the state machine. *)
 let commit (replica : replica) : unit =
-  (* TODO: apply to state machine *)
-  Printf.printf "commit called\n"
+  let exception Break in
+  try
+    for
+      (* Start applying from entry at index 1 or the last applied index. *)
+      i = Int64.to_int (Int64.max 1L replica.volatile_state.last_applied_index)
+      to Int64.to_int replica.volatile_state.commit_index
+    do
+      let i = Int64.of_int i in
+
+      let entry =
+        match replica.storage.entry_at_index i with
+        | None -> raise Break
+        | Some v -> v
+      in
+      replica.fsm_apply entry;
+      replica.volatile_state.last_applied_index <- i
+    done
+  with
+  | Break -> ()
+  | exn -> raise exn
 
 let handle_append_entries (replica : replica) (message : append_entries_input) :
     append_entries_output =
@@ -183,30 +206,44 @@ let test_disk_storage () : storage =
     append_entries = Disk_storage.append_entries disk_storage;
   }
 
+type test_replica = {
+  (* The replica being tested. *)
+  replica : replica;
+  (* A state machine used in tests. *)
+  kv : (string, string) Hashtbl.t;
+}
+
 (* Returns a replica that can be used in tests. *)
-let test_replica (initial_state : Protocol.initial_state) : replica =
+let test_replica (initial_state : Protocol.initial_state) : test_replica =
   let noop_transport =
     {
       send_request_vote_output = (fun _ _ -> ());
       send_append_entries_output = (fun _ _ -> ());
     }
   in
-  create ~transport:noop_transport ~storage:(test_disk_storage ())
-    ~initial_state
+
+  let kv = Hashtbl.create 0 in
+  {
+    replica =
+      create ~transport:noop_transport ~storage:(test_disk_storage ())
+        ~initial_state ~fsm_apply:(fun entry ->
+          Hashtbl.replace kv entry.data entry.data);
+    kv;
+  }
 
 let%test_unit "request vote: replica receives message with higher term -> \
                updates term, transitions to follower and resets voted for" =
   let storage = test_disk_storage () in
-  let replica = test_replica { current_term = 0L; voted_for = None } in
-  replica.volatile_state.state <- Leader;
+  let sut = test_replica { current_term = 0L; voted_for = None } in
+  sut.replica.volatile_state.state <- Leader;
   let actual =
-    handle_request_vote storage replica
+    handle_request_vote storage sut.replica
       { term = 1L; candidate_id = 1; last_log_index = 1L; last_log_term = 0L }
   in
   assert (actual = { term = 1L; vote_granted = true });
-  assert (replica.persistent_state.voted_for = Some 1);
-  assert (replica.persistent_state.current_term = 1L);
-  assert (replica.volatile_state.state = Follower)
+  assert (sut.replica.persistent_state.voted_for = Some 1);
+  assert (sut.replica.persistent_state.current_term = 1L);
+  assert (sut.replica.volatile_state.state = Follower)
 
 let%test_unit "request vote: replica receives a term greater than its own -> \
                become follower / update term / grants vote" =
@@ -221,17 +258,17 @@ let%test_unit "request vote: replica receives a term greater than its own -> \
       append_entries = (fun _ _ -> ());
     }
   in
-  let replica = test_replica { current_term = 1L; voted_for = None } in
-  replica.volatile_state.state <- Candidate;
+  let sut = test_replica { current_term = 1L; voted_for = None } in
+  sut.replica.volatile_state.state <- Candidate;
 
   let input : request_vote_input =
     { term = 2L; candidate_id = 1; last_log_index = 1L; last_log_term = 1L }
   in
   let expected : request_vote_output = { term = 2L; vote_granted = true } in
-  let actual = handle_request_vote storage replica input in
+  let actual = handle_request_vote storage sut.replica input in
 
-  assert (replica.volatile_state.state = Follower);
-  assert (replica.persistent_state.current_term = 2L);
+  assert (sut.replica.volatile_state.state = Follower);
+  assert (sut.replica.persistent_state.current_term = 2L);
   assert (actual = expected)
 
 let%test_unit "request vote: candidate term is not up to date -> do not grant \
@@ -247,14 +284,14 @@ let%test_unit "request vote: candidate term is not up to date -> do not grant \
       append_entries = (fun _ _ -> ());
     }
   in
-  let replica = test_replica { current_term = 1L; voted_for = None } in
+  let sut = test_replica { current_term = 1L; voted_for = None } in
 
   let input : request_vote_input =
     { term = 0L; candidate_id = 1; last_log_index = 0L; last_log_term = 0L }
   in
   let expected : request_vote_output = { term = 1L; vote_granted = false } in
 
-  assert (handle_request_vote storage replica input = expected)
+  assert (handle_request_vote storage sut.replica input = expected)
 
 let%test_unit "request vote: replica voted for someone else -> do not grant \
                vote" =
@@ -269,13 +306,13 @@ let%test_unit "request vote: replica voted for someone else -> do not grant \
       append_entries = (fun _ _ -> ());
     }
   in
-  let replica = test_replica { current_term = 0L; voted_for = Some 10 } in
+  let sut = test_replica { current_term = 0L; voted_for = Some 10 } in
 
   let input : request_vote_input =
     { term = 0L; candidate_id = 1; last_log_index = 0L; last_log_term = 0L }
   in
   let expected : request_vote_output = { term = 0L; vote_granted = false } in
-  let actual = handle_request_vote storage replica input in
+  let actual = handle_request_vote storage sut.replica input in
 
   assert (actual = expected)
 
@@ -292,13 +329,13 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
       append_entries = (fun _ _ -> ());
     }
   in
-  let replica = test_replica { current_term = 2L; voted_for = None } in
+  let sut = test_replica { current_term = 2L; voted_for = None } in
 
   let input : request_vote_input =
     { term = 1L; candidate_id = 1; last_log_index = 3L; last_log_term = 1L }
   in
   let expected : request_vote_output = { term = 2L; vote_granted = false } in
-  let actual = handle_request_vote storage replica input in
+  let actual = handle_request_vote storage sut.replica input in
 
   assert (actual = expected)
 
@@ -315,37 +352,37 @@ let%test_unit "request vote: same last log term but replica's last log index \
       append_entries = (fun _ _ -> ());
     }
   in
-  let replica = test_replica { current_term = 2L; voted_for = None } in
+  let sut = test_replica { current_term = 2L; voted_for = None } in
 
   let input : request_vote_input =
     { term = 2L; candidate_id = 1; last_log_index = 4L; last_log_term = 2L }
   in
   let expected : request_vote_output = { term = 2L; vote_granted = false } in
-  let actual = handle_request_vote storage replica input in
+  let actual = handle_request_vote storage sut.replica input in
 
   assert (actual = expected)
 
 let%test_unit "request vote: replica persists decision to storage" =
   let storage = test_disk_storage () in
-  let replica = test_replica { current_term = 0L; voted_for = None } in
+  let sut = test_replica { current_term = 0L; voted_for = None } in
 
   (* Replica should grant vote to candidate *)
   let input : request_vote_input =
     { term = 1L; candidate_id = 5; last_log_index = 4L; last_log_term = 2L }
   in
   let expected : request_vote_output = { term = 1L; vote_granted = true } in
-  let actual = handle_request_vote storage replica input in
+  let actual = handle_request_vote storage sut.replica input in
   assert (actual = expected);
 
   (* Replica should know it voted in the candidate after restarting *)
-  let replica = test_replica (storage.initial_state ()) in
+  let sut = test_replica (storage.initial_state ()) in
 
-  assert (replica.persistent_state.voted_for = Some 5)
+  assert (sut.replica.persistent_state.voted_for = Some 5)
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
-  let replica = test_replica { current_term = 1L; voted_for = None } in
+  let sut = test_replica { current_term = 1L; voted_for = None } in
   let actual =
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 0L;
         leader_id = 1;
@@ -360,10 +397,10 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
 let%test_unit "append entries: message.previous_log_index > \
                replica.last_lost_index, reject request" =
   (* Replica with empty log. Last log index is 0. *)
-  let replica = test_replica { current_term = 0L; voted_for = None } in
+  let sut = test_replica { current_term = 0L; voted_for = None } in
   (* Leader thinks the index of previous log sent to this replica is 1. *)
   let actual =
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 1L;
         leader_id = 1;
@@ -377,11 +414,11 @@ let%test_unit "append entries: message.previous_log_index > \
   assert (actual = { term = 1L; success = false; last_log_index = 0L })
 
 let%test_unit "append entries: truncates log in conflict" =
-  let replica = test_replica { current_term = 0L; voted_for = None } in
+  let sut = test_replica { current_term = 0L; voted_for = None } in
 
   (* Leader appends some entries to the replica's log. *)
   assert (
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 1L;
         leader_id = 1;
@@ -399,7 +436,7 @@ let%test_unit "append entries: truncates log in conflict" =
 
   (* Another leader overrides the entries starting at index 3. *)
   assert (
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 2L;
         leader_id = 2;
@@ -418,11 +455,11 @@ let%test_unit "append entries: truncates log in conflict" =
 let%test_unit "append entries: log entry at previous_log_index does not match \
                previous_log_term should truncate log" =
   (* Replica with empty log. Last log index is 0. *)
-  let replica = test_replica { current_term = 0L; voted_for = None } in
+  let sut = test_replica { current_term = 0L; voted_for = None } in
 
   (* Replica's log is empty. Leader thinks the previous log entry at index 1. *)
   assert (
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 1L;
         leader_id = 1;
@@ -435,7 +472,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
 
   (* Append one entry to the replica's log. *)
   assert (
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 1L;
         leader_id = 1;
@@ -448,7 +485,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
 
   (* previous_log_term does not match the entry at previous_log_index *)
   assert (
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 1L;
         leader_id = 1;
@@ -462,12 +499,12 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
 let%test_unit "append entries: leader commit index > replica commit index, \
                should update commit index" =
   (* Replica with empty log. Last log index is 0. *)
-  let replica = test_replica { current_term = 0L; voted_for = None } in
+  let sut = test_replica { current_term = 0L; voted_for = None } in
   print_endline "        here";
 
   (* Append some entries to the log. *)
   assert (
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 1L;
         leader_id = 1;
@@ -478,9 +515,9 @@ let%test_unit "append entries: leader commit index > replica commit index, \
       }
     = { term = 1L; success = true; last_log_index = 2L });
 
-  (* Leader has commited entries up to index 2. *)
+  (* Leader has commited entries up to index 2. Replica shoulda apply entries 1 and 2 to the state machine. *)
   assert (
-    handle_append_entries replica
+    handle_append_entries sut.replica
       {
         leader_term = 1L;
         leader_id = 1;
@@ -489,6 +526,28 @@ let%test_unit "append entries: leader commit index > replica commit index, \
         entries = [ { term = 1L; data = "3" } ];
         leader_commit = 2L;
       }
-    = { term = 1L; success = true; last_log_index = 3L })
+    = { term = 1L; success = true; last_log_index = 3L });
 
-(* There's 3 entries in the log. Two of them are commited. Should apply the commited entries to the state machine. *)
+  (* Two entries should have been aplied to the state machine so there's two entries in the kv. *)
+  assert (Hashtbl.length sut.kv = 2);
+  assert (Hashtbl.mem sut.kv "1");
+  assert (Hashtbl.mem sut.kv "2");
+
+  (* Leader has committed up to index 3. Should apply entries up to index 3. *)
+  assert (
+    handle_append_entries sut.replica
+      {
+        leader_term = 1L;
+        leader_id = 1;
+        previous_log_index = 3L;
+        previous_log_term = 1L;
+        entries = [];
+        leader_commit = 3L;
+      }
+    = { term = 1L; success = true; last_log_index = 3L });
+
+  (* Entries 1 and 2 had already been applied. Should have applied entry 3 now. *)
+  assert (Hashtbl.length sut.kv = 3);
+  assert (Hashtbl.mem sut.kv "1");
+  assert (Hashtbl.mem sut.kv "2");
+  assert (Hashtbl.mem sut.kv "3")

@@ -254,9 +254,11 @@ let append_entries (storage : t) (previous_log_index : int64)
   storage.last_log_index <-
     Int64.add storage.last_log_index (Int64.of_int (List.length entries));
 
-  (* List.nth and List.length are fine assuming that only a small number of entries are stored at a time.  *)
-  let last_entry = List.nth entries (List.length entries - 1) in
-  storage.last_log_term <- last_entry.term
+  (* List.nth and List.length are fine assuming that only a small number of entries are stored at a time. *)
+  (if List.length entries > 0 then
+     let last_entry = List.nth entries (List.length entries - 1) in
+     storage.last_log_term <- last_entry.term);
+  ()
 
 let persist (storage : t) (state : Protocol.persistent_state) : unit =
   let contents =

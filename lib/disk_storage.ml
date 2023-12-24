@@ -27,7 +27,7 @@ type header = {
 }
 
 (* How many bytes each log entry occupies on disk *)
-let page_size_in_bytes = 256L
+let page_size_in_bytes = 64L
 
 (* The name given to the file that is used to store the last term the replica has seen and who it voted for *)
 let state_file_name = "state.raft"
@@ -200,9 +200,26 @@ let last_log_entry (file : in_channel) : Protocol.entry option =
   iter file ~f:(fun entry -> last_entry := Some entry);
   !last_entry
 
+let truncate (storage : t) (index : int64) : unit =
+  let entry_ends_at = Int64.mul index page_size_in_bytes in
+
+  let file_descr = Unix.descr_of_out_channel storage.log_file_out in
+
+  Unix.ftruncate file_descr (Int64.to_int entry_ends_at);
+  Unix.fsync file_descr;
+
+  storage.last_log_index <- index;
+  storage.last_log_term <-
+    (if index = 0L then 0L
+     else
+       match entry_at_index storage index with
+       | None -> 0L
+       | Some entry -> entry.term)
+
 (* TODO: store entries with len > page size in other files and point to them *)
 (* Stores [entries] on disk *)
-let append_entries (storage : t) (entries : Protocol.entry list) : unit =
+let append_entries (storage : t) (previous_log_index : int64)
+    (entries : Protocol.entry list) : unit =
   let new_entries_start_at_offset =
     Int64.mul storage.last_log_index page_size_in_bytes
   in
@@ -210,7 +227,27 @@ let append_entries (storage : t) (entries : Protocol.entry list) : unit =
   (* Move the pointer just after the latest entry that was successfully stored.  *)
   seek_out storage.log_file_out (Int64.to_int new_entries_start_at_offset);
 
-  List.iter (fun entry -> write_entry storage.log_file_out entry) entries;
+  List.iteri
+    (fun (i : int) (entry : Protocol.entry) ->
+      (* Add 1 because the log is 1-indexed. *)
+      let entry_index = Int64.add previous_log_index (Int64.of_int (i + 1)) in
+
+      match entry_at_index storage entry_index with
+      (* New entry, append to the log. *)
+      | None ->
+          Printf.printf "append_entries: writing\n";
+          write_entry storage.log_file_out entry
+      | Some existing_entry ->
+          (* New entry conflicts with existing entry, truncate the log and append the new entry. *)
+          if existing_entry.term <> entry.term then (
+            Printf.printf "append_entries: truncating at index %Ld\n"
+              (Int64.sub entry_index 1L);
+            truncate storage (Int64.sub entry_index 1L);
+            write_entry storage.log_file_out entry);
+
+          (* If the entry already exists and there's not conflict, do nothing. *)
+          ())
+    entries;
 
   Out_channel.flush storage.log_file_out;
 
@@ -220,20 +257,6 @@ let append_entries (storage : t) (entries : Protocol.entry list) : unit =
   (* List.nth and List.length are fine assuming that only a small number of entries are stored at a time.  *)
   let last_entry = List.nth entries (List.length entries - 1) in
   storage.last_log_term <- last_entry.term
-
-let%test_unit "append entries: updates last log term and last log index" =
-  let storage = create { dir = Test_util.temp_dir () } in
-
-  append_entries storage [ { term = 2L; data = "1" } ];
-
-  assert (2L = last_log_term storage);
-  (* The first entry starts at index 1. *)
-  assert (1L = last_log_index storage);
-
-  append_entries storage [ { term = 3L; data = "1" } ];
-
-  assert (3L = last_log_term storage);
-  assert (2L = last_log_index storage)
 
 let persist (storage : t) (state : Protocol.persistent_state) : unit =
   let contents =
@@ -246,6 +269,42 @@ let persist (storage : t) (state : Protocol.persistent_state) : unit =
   seek_out storage.state_file_out 0;
   Out_channel.output_string storage.state_file_out contents;
   Out_channel.flush storage.state_file_out
+
+let%test_unit "append entries: updates last log term and last log index" =
+  let storage = create { dir = Test_util.temp_dir () } in
+
+  append_entries storage 0L [ { term = 2L; data = "1" } ];
+
+  assert (2L = last_log_term storage);
+  (* The first entry starts at index 1. *)
+  assert (1L = last_log_index storage);
+
+  append_entries storage (last_log_index storage) [ { term = 3L; data = "1" } ];
+
+  assert (3L = last_log_term storage);
+  assert (2L = last_log_index storage)
+
+let%test_unit "append entries: truncates the log on entry conflict" =
+  let storage = create { dir = Test_util.temp_dir () } in
+
+  (* Leader adds some entries to the replica's log. *)
+  append_entries storage (last_log_index storage)
+    [
+      { term = 1L; data = "1" };
+      { term = 2L; data = "2" };
+      { term = 3L; data = "3" };
+    ];
+
+  (* Another leader overrides the replica's log. *)
+  append_entries storage 2L
+    [ { term = 4L; data = "3" }; { term = 4L; data = "4" } ];
+
+  assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
+  assert (entry_at_index storage 2L = Some { term = 2L; data = "2" });
+  (* Entry at index 3 has been overwritten. *)
+  assert (entry_at_index storage 3L = Some { term = 4L; data = "3" });
+  (* Entry at index 4 is new. *)
+  assert (entry_at_index storage 4L = Some { term = 4L; data = "4" })
 
 let%test_unit "persist: stores persistent state on disk" =
   let temp_dir = Test_util.temp_dir () in
@@ -274,16 +333,6 @@ let%test_unit "persist: stores persistent state on disk" =
 
   assert (expected = state)
 
-let truncate (storage : t) (index : int64) : unit =
-  let entry_ends_at = Int64.mul index page_size_in_bytes in
-
-  let file_descr = Unix.descr_of_out_channel storage.log_file_out in
-
-  Unix.ftruncate file_descr (Int64.to_int entry_ends_at);
-  Unix.fsync file_descr;
-
-  storage.last_log_index <- index
-
 let%test_unit "last_log_term: returns the term of the last log entry" =
   (* Given an empty log *)
   let storage = create { dir = Test_util.temp_dir () } in
@@ -292,7 +341,7 @@ let%test_unit "last_log_term: returns the term of the last log entry" =
   assert (0L = last_log_term storage);
 
   (* Given a non-empty log *)
-  append_entries storage
+  append_entries storage (last_log_index storage)
     [
       { term = 0L; data = "0" };
       { term = 1L; data = "1" };
@@ -310,7 +359,7 @@ let%test_unit "last_log_index: returns the index of the last log entry" =
   assert (0L = last_log_index storage);
 
   (* Given a non-empty log *)
-  append_entries storage
+  append_entries storage (last_log_index storage)
     [
       { term = 0L; data = "0" };
       { term = 1L; data = "1" };
@@ -361,13 +410,13 @@ let%test_unit "entry_at_index: returns the entry at the index" =
   assert (entry_at_index storage 1L = None);
 
   (* Append an entry to the log. *)
-  append_entries storage [ { term = 1L; data = "1" } ];
+  append_entries storage (last_log_index storage) [ { term = 1L; data = "1" } ];
 
   (* Should be able to get the entry we just appended. *)
   assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
 
   (* Append another entry to the log. *)
-  append_entries storage [ { term = 1L; data = "2" } ];
+  append_entries storage (last_log_index storage) [ { term = 1L; data = "2" } ];
 
   (* Should be able to get the entry we just appended and the previous entry. *)
   assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
@@ -381,17 +430,19 @@ let%test_unit "truncate: truncates the log to index" =
   assert (entry_at_index storage 1L = None);
 
   (* Append an entry to the log. *)
-  append_entries storage
+  append_entries storage (last_log_index storage)
     [
       { term = 1L; data = "1" };
-      { term = 1L; data = "2" };
-      { term = 2L; data = "3" };
+      { term = 2L; data = "2" };
+      { term = 3L; data = "3" };
     ];
 
   (* Get the entries that were just appended. *)
   assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
-  assert (entry_at_index storage 2L = Some { term = 1L; data = "2" });
-  assert (entry_at_index storage 3L = Some { term = 2L; data = "3" });
+  assert (entry_at_index storage 2L = Some { term = 2L; data = "2" });
+  assert (entry_at_index storage 3L = Some { term = 3L; data = "3" });
+  assert (last_log_index storage = 3L);
+  assert (last_log_term storage = 3L);
 
   (* Truncate the log. Remove entries after index 1. *)
   truncate storage 1L;
@@ -400,19 +451,25 @@ let%test_unit "truncate: truncates the log to index" =
   assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
   assert (entry_at_index storage 2L = None);
   assert (entry_at_index storage 3L = None);
+  assert (last_log_index storage = 1L);
+  assert (last_log_term storage = 1L);
 
   (* Append the entries again. They should go to the end of the log. *)
-  append_entries storage
-    [ { term = 1L; data = "2" }; { term = 2L; data = "3" } ];
+  append_entries storage (last_log_index storage)
+    [ { term = 2L; data = "2" }; { term = 3L; data = "3" } ];
 
   (* Ensure the entries have been appended and we can read them. *)
   assert (entry_at_index storage 1L = Some { term = 1L; data = "1" });
-  assert (entry_at_index storage 2L = Some { term = 1L; data = "2" });
-  assert (entry_at_index storage 3L = Some { term = 2L; data = "3" });
+  assert (entry_at_index storage 2L = Some { term = 2L; data = "2" });
+  assert (entry_at_index storage 3L = Some { term = 3L; data = "3" });
+  assert (last_log_index storage = 3L);
+  assert (last_log_term storage = 3L);
 
   (* Empty the log. *)
   truncate storage 0L;
 
   assert (entry_at_index storage 1L = None);
   assert (entry_at_index storage 2L = None);
-  assert (entry_at_index storage 3L = None)
+  assert (entry_at_index storage 3L = None);
+  assert (last_log_index storage = 0L);
+  assert (last_log_term storage = 0L)

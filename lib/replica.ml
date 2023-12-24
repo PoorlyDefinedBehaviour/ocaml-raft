@@ -15,7 +15,7 @@ type storage = {
   (* Truncates the log starting from the index. *)
   truncate : int64 -> unit;
   (* Appends entries to the log.  *)
-  append_entries : Protocol.entry list -> unit;
+  append_entries : int64 -> Protocol.entry list -> unit;
 }
 [@@deriving show]
 
@@ -113,7 +113,15 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
 
   if
     message.leader_term < replica.persistent_state.current_term
-    || message.previous_log_index > replica.storage.last_log_index ()
+    (* TODO: what if previous_log_index is 0? *)
+    || message.previous_log_index > 0L
+       &&
+       match replica.storage.entry_at_index message.previous_log_index with
+       | None -> true
+       | Some entry ->
+           Printf.printf "entry.term=%Ld previous_log_term=%Ld\n" entry.term
+             message.previous_log_term;
+           entry.term <> message.previous_log_term
   then
     {
       term = replica.persistent_state.current_term;
@@ -122,26 +130,8 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       last_log_index = replica.storage.last_log_index ();
     }
   else (
-    (* TOOD: handle case where previous_log_index = 0 but last_log_index() is not 0 *)
-    (if message.previous_log_index > 0L then
-       let entry =
-         Option.get (replica.storage.entry_at_index message.previous_log_index)
-       in
-
-       (* TODO: should we check every new entry for conflicts? *)
-       (* Truncate log if leader the log in this replica does not match the leader's log. *)
-       if entry.term <> message.previous_log_term then (
-         (* Truncate to the entry before the starting log index in the message. *)
-         Printf.printf
-           "before truncate call: previous_log_index=%Ld truncate_index=%Ld \
-            entry=%s previous_log_term=%Ld entry.term=%Ld\n"
-           message.previous_log_index
-           (Int64.sub message.previous_log_index 1L)
-           (show_entry entry) message.previous_log_term entry.term;
-         replica.storage.truncate (Int64.sub message.previous_log_index 1L)));
-
     (* Append new entries to the log. *)
-    replica.storage.append_entries message.entries;
+    replica.storage.append_entries message.previous_log_index message.entries;
 
     (* Update the latest known committed index because the leader may have committed some entries.
        The commit index is the minimum between the leader commit index and the last log entry index
@@ -228,7 +218,7 @@ let%test_unit "request vote: replica receives a term greater than its own -> \
       persist = (fun _ -> ());
       entry_at_index = (fun _ -> None);
       truncate = (fun _ -> ());
-      append_entries = (fun _ -> ());
+      append_entries = (fun _ _ -> ());
     }
   in
   let replica = test_replica { current_term = 1L; voted_for = None } in
@@ -254,7 +244,7 @@ let%test_unit "request vote: candidate term is not up to date -> do not grant \
       persist = (fun _ -> ());
       entry_at_index = (fun _ -> None);
       truncate = (fun _ -> ());
-      append_entries = (fun _ -> ());
+      append_entries = (fun _ _ -> ());
     }
   in
   let replica = test_replica { current_term = 1L; voted_for = None } in
@@ -276,7 +266,7 @@ let%test_unit "request vote: replica voted for someone else -> do not grant \
       persist = (fun _ -> ());
       entry_at_index = (fun _ -> None);
       truncate = (fun _ -> ());
-      append_entries = (fun _ -> ());
+      append_entries = (fun _ _ -> ());
     }
   in
   let replica = test_replica { current_term = 0L; voted_for = Some 10 } in
@@ -299,7 +289,7 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
       persist = (fun _ -> ());
       entry_at_index = (fun _ -> None);
       truncate = (fun _ -> ());
-      append_entries = (fun _ -> ());
+      append_entries = (fun _ _ -> ());
     }
   in
   let replica = test_replica { current_term = 2L; voted_for = None } in
@@ -322,7 +312,7 @@ let%test_unit "request vote: same last log term but replica's last log index \
       persist = (fun _ -> ());
       entry_at_index = (fun _ -> None);
       truncate = (fun _ -> ());
-      append_entries = (fun _ -> ());
+      append_entries = (fun _ _ -> ());
     }
   in
   let replica = test_replica { current_term = 2L; voted_for = None } in
@@ -386,52 +376,94 @@ let%test_unit "append entries: message.previous_log_index > \
   (* Replica should reject the append entries request. *)
   assert (actual = { term = 1L; success = false; last_log_index = 0L })
 
-let%test_unit "append entries: log entry at index does not match \
-               message.previous_log_term, should truncate log" =
-  (* Replica with empty log. Last log index is 0. *)
+let%test_unit "append entries: truncates log in conflict" =
   let replica = test_replica { current_term = 0L; voted_for = None } in
 
-  (* Append one entry to the replica's log. *)
-  let _ =
+  (* Leader appends some entries to the replica's log. *)
+  assert (
     handle_append_entries replica
       {
         leader_term = 1L;
         leader_id = 1;
         previous_log_index = 0L;
         previous_log_term = 0L;
-        entries = [ { term = 1L; data = "hello world" } ];
+        entries =
+          [
+            { term = 1L; data = "1" };
+            { term = 1L; data = "2" };
+            { term = 1L; data = "3" };
+          ];
         leader_commit = 0L;
       }
-  in
+    = { term = 1L; success = true; last_log_index = 3L });
 
-  (* Get the entry that was just appended. *)
+  (* Another leader overrides the entries starting at index 3. *)
   assert (
-    replica.storage.entry_at_index 1L = Some { term = 1L; data = "hello world" });
+    handle_append_entries replica
+      {
+        leader_term = 2L;
+        leader_id = 2;
+        previous_log_index = 2L;
+        previous_log_term = 1L;
+        entries =
+          [
+            { term = 2L; data = "4" };
+            { term = 2L; data = "5" };
+            { term = 2L; data = "6" };
+          ];
+        leader_commit = 1L;
+      }
+    = { term = 2L; success = true; last_log_index = 5L })
 
-  (* Another leader tries to append entries but the entry at previous_log_index does not match previous_log_term. *)
-  let actual =
+let%test_unit "append entries: log entry at previous_log_index does not match \
+               previous_log_term should truncate log" =
+  (* Replica with empty log. Last log index is 0. *)
+  let replica = test_replica { current_term = 0L; voted_for = None } in
+
+  (* Replica's log is empty. Leader thinks the previous log entry at index 1. *)
+  assert (
     handle_append_entries replica
       {
         leader_term = 1L;
         leader_id = 1;
         previous_log_index = 1L;
         previous_log_term = 0L;
-        entries = [ { term = 1L; data = "hello world 2" } ];
+        entries = [ { term = 1L; data = "hello world" } ];
         leader_commit = 0L;
       }
-  in
+    = { term = 1L; success = false; last_log_index = 0L });
 
-  assert (actual = { term = 1L; success = true; last_log_index = 1L });
-
-  (* The log should have been truncated which means the entry at index 1 is the new entry. *)
+  (* Append one entry to the replica's log. *)
   assert (
-    replica.storage.entry_at_index 1L
-    = Some { term = 1L; data = "hello world 2" })
+    handle_append_entries replica
+      {
+        leader_term = 1L;
+        leader_id = 1;
+        previous_log_index = 0L;
+        previous_log_term = 0L;
+        entries = [ { term = 1L; data = "1" } ];
+        leader_commit = 0L;
+      }
+    = { term = 1L; success = true; last_log_index = 1L });
+
+  (* previous_log_term does not match the entry at previous_log_index *)
+  assert (
+    handle_append_entries replica
+      {
+        leader_term = 1L;
+        leader_id = 1;
+        previous_log_index = 1L;
+        previous_log_term = 0L;
+        entries = [ { term = 1L; data = "2" } ];
+        leader_commit = 0L;
+      }
+    = { term = 1L; success = false; last_log_index = 1L })
 
 let%test_unit "append entries: leader commit index > replica commit index, \
                should update commit index" =
   (* Replica with empty log. Last log index is 0. *)
   let replica = test_replica { current_term = 0L; voted_for = None } in
+  print_endline "        here";
 
   (* Append some entries to the log. *)
   assert (

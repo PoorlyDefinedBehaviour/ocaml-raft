@@ -245,7 +245,7 @@ let append_entries (storage : t) (previous_log_index : int64)
             truncate storage (Int64.sub entry_index 1L);
             write_entry storage.log_file_out entry);
 
-          (* If the entry already exists and there's not conflict, do nothing. *)
+          (* If the entry already exists and there's no conflict, do nothing. *)
           ())
     entries;
 

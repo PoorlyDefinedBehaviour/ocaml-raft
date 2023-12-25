@@ -1,4 +1,5 @@
 open Protocol
+module ReplicaIdSet = Set.Make (Int64)
 
 type storage = {
   (* Returns the persistent state stored on disk.
@@ -29,12 +30,33 @@ type transport = {
 [@@deriving show]
 
 type replica = {
+  (* This replica's id. *)
+  id : replica_id;
   persistent_state : persistent_state;
   volatile_state : volatile_state;
   storage : storage;
   transport : transport;
   (* Function called to apply an entry to the state machine. *)
   fsm_apply : Protocol.entry -> unit;
+}
+[@@deriving show]
+
+type volatile_state = {
+  (* If the replica is a leader/candidate/follower *)
+  mutable state : Protocol.state;
+  (* Index of the highest log entry known to be committed. Initialized to 0. Monotonically increasing. *)
+  mutable commit_index : int64;
+  (* Index of the highest log entry applied to the state machine. Initialized to 0. Monotonically increasing. *)
+  mutable last_applied_index : int64;
+  (* The state of the current election (If there's one) *)
+  mutable election : election option;
+}
+[@@deriving show]
+
+type election = {
+  (* A set containing the id of the replicas that voted for the candidate. *)
+  votes_received : ReplicaIdSet.t;
+      [@printer fun fmt -> fprintf fmt "ReplicaIdSet"]
 }
 [@@deriving show]
 
@@ -178,9 +200,11 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
     })
 
 let start_election (replica : replica) : request_vote_input list =
-  (* replica.persistent_state.current_term <-
-     replica.persistent_state.current_term+1L;
-     replica.volatile_state.election = {votes_received=1; *)
+  replica.persistent_state.current_term <-
+    replica.persistent_state.current_term + 1L;
+  (* votes_received starts at 1 because the candidate votes for itself. *)
+  replica.election <-
+    { votes_received = ReplicaIdSet.add replica.id ReplicaIdSet.empty };
   assert false
 
 let handle_message (replica : replica) (input_message : input_message) =

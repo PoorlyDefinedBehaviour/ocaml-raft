@@ -11,16 +11,6 @@ type persistent_state = {
 
 type state = Follower | Candidate | Leader [@@deriving show]
 
-type volatile_state = {
-  (* If the replica is a leader/candidate/follower *)
-  mutable state : state;
-  (* Index of the highest log entry known to be committed. Initialized to 0. Monotonically increasing. *)
-  mutable commit_index : int64;
-  (* Index of the highest log entry applied to the state machine. Initialized to 0. Monotonically increasing. *)
-  mutable last_applied_index : int64;
-}
-[@@deriving show]
-
 type request_vote_input = {
   (* Candidate's term *)
   term : term;

@@ -234,14 +234,10 @@ let append_entries (storage : t) (previous_log_index : int64)
 
       match entry_at_index storage entry_index with
       (* New entry, append to the log. *)
-      | None ->
-          Printf.printf "append_entries: writing\n";
-          write_entry storage.log_file_out entry
+      | None -> write_entry storage.log_file_out entry
       | Some existing_entry ->
           (* New entry conflicts with existing entry, truncate the log and append the new entry. *)
           if existing_entry.term <> entry.term then (
-            Printf.printf "append_entries: truncating at index %Ld\n"
-              (Int64.sub entry_index 1L);
             truncate storage (Int64.sub entry_index 1L);
             write_entry storage.log_file_out entry);
 

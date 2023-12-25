@@ -136,7 +136,8 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
     append_entries_output =
   if message.leader_term > replica.persistent_state.current_term then (
     replica.persistent_state.current_term <- message.leader_term;
-    replica.volatile_state.state <- Follower);
+    replica.volatile_state.state <- Follower;
+    replica.storage.persist replica.persistent_state);
 
   if
     message.leader_term < replica.persistent_state.current_term
@@ -145,10 +146,7 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
        &&
        match replica.storage.entry_at_index message.previous_log_index with
        | None -> true
-       | Some entry ->
-           Printf.printf "entry.term=%Ld previous_log_term=%Ld\n" entry.term
-             message.previous_log_term;
-           entry.term <> message.previous_log_term
+       | Some entry -> entry.term <> message.previous_log_term
   then
     {
       term = replica.persistent_state.current_term;
@@ -179,6 +177,12 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       last_log_index = replica.storage.last_log_index ();
     })
 
+let start_election (replica : replica) : request_vote_input list =
+  (* replica.persistent_state.current_term <-
+     replica.persistent_state.current_term+1L;
+     replica.volatile_state.election = {votes_received=1; *)
+  assert false
+
 let handle_message (replica : replica) (input_message : input_message) =
   match input_message with
   | RequestVote message ->
@@ -193,8 +197,7 @@ let handle_message (replica : replica) (input_message : input_message) =
         output_message
 
 (* Returns a Disk_storage instance which writes to a temp folder. *)
-let test_disk_storage () : storage =
-  let dir = Test_util.temp_dir () in
+let test_disk_storage ~(dir : string) : storage =
   Printf.printf "Disk_storage dir = %s\n" dir;
   let disk_storage = Disk_storage.create { dir } in
   {
@@ -209,6 +212,8 @@ let test_disk_storage () : storage =
   }
 
 type test_replica = {
+  (* The directory used to store Raft files. *)
+  storage_dir : string;
   (* The replica being tested. *)
   replica : replica;
   (* A state machine used in tests. *)
@@ -216,7 +221,8 @@ type test_replica = {
 }
 
 (* Returns a replica that can be used in tests. *)
-let test_replica (initial_state : Protocol.initial_state) : test_replica =
+let test_replica ?(dir : string option) (initial_state : Protocol.initial_state)
+    : test_replica =
   let noop_transport =
     {
       send_request_vote_output = (fun _ _ -> ());
@@ -224,12 +230,14 @@ let test_replica (initial_state : Protocol.initial_state) : test_replica =
     }
   in
 
+  let dir = match dir with None -> Test_util.temp_dir () | Some v -> v in
+  let storage = test_disk_storage ~dir in
   let kv = Hashtbl.create 0 in
   {
+    storage_dir = dir;
     replica =
-      create ~transport:noop_transport ~storage:(test_disk_storage ())
-        ~initial_state ~fsm_apply:(fun entry ->
-          Hashtbl.replace kv entry.data entry.data);
+      create ~transport:noop_transport ~storage ~initial_state
+        ~fsm_apply:(fun entry -> Hashtbl.replace kv entry.data entry.data);
     kv;
   }
 
@@ -245,7 +253,15 @@ let%test_unit "request vote: replica receives message with higher term -> \
   assert (actual = { term = 1L; vote_granted = true });
   assert (sut.replica.persistent_state.voted_for = Some 1);
   assert (sut.replica.persistent_state.current_term = 1L);
-  assert (sut.replica.volatile_state.state = Follower)
+  assert (sut.replica.volatile_state.state = Follower);
+
+  (* Ensure that the state change has been persisted to storage by restarting the replica. *)
+  let sut =
+    test_replica ~dir:sut.storage_dir { current_term = 0L; voted_for = None }
+  in
+  assert (
+    sut.replica.storage.initial_state ()
+    = { current_term = 1L; voted_for = Some 1 })
 
 let%test_unit "request vote: candidate term is not up to date -> do not grant \
                vote" =
@@ -443,7 +459,6 @@ let%test_unit "append entries: leader commit index > replica commit index, \
                should update commit index" =
   (* Replica with empty log. Last log index is 0. *)
   let sut = test_replica { current_term = 0L; voted_for = None } in
-  print_endline "        here";
 
   (* Append some entries to the log. *)
   assert (
@@ -494,3 +509,34 @@ let%test_unit "append entries: leader commit index > replica commit index, \
   assert (Hashtbl.mem sut.kv "1");
   assert (Hashtbl.mem sut.kv "2");
   assert (Hashtbl.mem sut.kv "3")
+
+let%test_unit "append entries: message term > replica term, update own term \
+               and transition to follower" =
+  (* Given a replica in the Candidate state *)
+  let sut = test_replica { current_term = 0L; voted_for = None } in
+  sut.replica.volatile_state.state <- Candidate;
+
+  (* Replica receives a message with a term greater than its own *)
+  assert (
+    handle_append_entries sut.replica
+      {
+        leader_term = 1L;
+        leader_id = 1;
+        previous_log_index = 0L;
+        previous_log_term = 0L;
+        entries = [ { term = 1L; data = "1" } ];
+        leader_commit = 0L;
+      }
+    = { term = 1L; success = true; last_log_index = 1L });
+
+  (* Updates term and transitions to Follower *)
+  assert (sut.replica.volatile_state.state = Follower);
+  assert (sut.replica.persistent_state.current_term = 1L);
+
+  (* Ensure that the state change has been persisted to storage by restarting the replica. *)
+  let sut =
+    test_replica ~dir:sut.storage_dir { current_term = 0L; voted_for = None }
+  in
+  assert (
+    sut.replica.storage.initial_state ()
+    = { current_term = 1L; voted_for = None })

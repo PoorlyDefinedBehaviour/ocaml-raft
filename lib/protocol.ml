@@ -14,8 +14,10 @@ type state = Follower | Candidate | Leader [@@deriving show]
 type request_vote_input = {
   (* Candidate's term *)
   term : term;
-  (* Candidate requestingf vote *)
+  (* Candidate requesting vote *)
   candidate_id : replica_id;
+  (* Replica receiving the message *)
+  replica_id : replica_id;
   (* Index of candidate's last log entry *)
   last_log_index : int64;
   (* Term of candidate's last log entry *)
@@ -29,6 +31,8 @@ type initial_state = { current_term : term; voted_for : replica_id option }
 type request_vote_output = {
   (* The current term in the replica that received the request vote request *)
   term : term;
+  (* The replica that sent the message *)
+  replica_id : replica_id;
   (* True means candidate received vote *)
   vote_granted : bool;
 }
@@ -41,6 +45,8 @@ type append_entries_input = {
   leader_term : term;
   (* So follower can redirect clients *)
   leader_id : replica_id;
+  (* Replica receiving the message. *)
+  replica_id : replica_id;
   (* Index of log entry immediately preceding new ones *)
   previous_log_index : int64;
   (* Term of [previous_log_index] entry *)

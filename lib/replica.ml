@@ -1,5 +1,5 @@
 open Protocol
-module ReplicaIdSet = Set.Make (Int64)
+module ReplicaIdSet = Set.Make (Int)
 
 type storage = {
   (* Returns the persistent state stored on disk.
@@ -21,23 +21,22 @@ type storage = {
 [@@deriving show]
 
 type transport = {
+  (* Sends a request vote request to the replica. *)
+  send_request_vote_input : replica_id -> request_vote_input -> unit;
   (* Sends a request vote response to the replica. *)
   send_request_vote_output : replica_id -> request_vote_output -> unit;
+  (* Send a append entries request to the replica. *)
+  send_append_entries_input :
+    replica_id -> Protocol.append_entries_input -> unit;
   (* Sends a append entries response to the replica. *)
   send_append_entries_output :
     replica_id -> Protocol.append_entries_output -> unit;
 }
 [@@deriving show]
 
-type replica = {
-  (* This replica's id. *)
-  id : replica_id;
-  persistent_state : persistent_state;
-  volatile_state : volatile_state;
-  storage : storage;
-  transport : transport;
-  (* Function called to apply an entry to the state machine. *)
-  fsm_apply : Protocol.entry -> unit;
+type election = {
+  (* A set containing the id of the replicas that voted for the candidate. *)
+  mutable votes_received : ReplicaIdSet.t; [@opaque]
 }
 [@@deriving show]
 
@@ -49,20 +48,41 @@ type volatile_state = {
   (* Index of the highest log entry applied to the state machine. Initialized to 0. Monotonically increasing. *)
   mutable last_applied_index : int64;
   (* The state of the current election (If there's one) *)
-  mutable election : election option;
+  mutable election : election;
 }
 [@@deriving show]
 
-type election = {
-  (* A set containing the id of the replicas that voted for the candidate. *)
-  votes_received : ReplicaIdSet.t;
-      [@printer fun fmt -> fprintf fmt "ReplicaIdSet"]
+(* The replica configuration. *)
+type config = {
+  (* The ids of the replicas in the cluster. Must include the replica id. *)
+  cluster_members : replica_id list;
+}
+[@@deriving show]
+
+type replica = {
+  (* This replica's id. *)
+  id : replica_id;
+  config : config;
+  persistent_state : persistent_state;
+  volatile_state : volatile_state;
+  storage : storage;
+  transport : transport;
+  (* Function called to apply an entry to the state machine. *)
+  fsm_apply : Protocol.entry -> unit;
 }
 [@@deriving show]
 
 type input_message =
+  (* The election timeout has fired. *)
+  | ElectionTimeoutFired
+  (* Received a request vote request. *)
   | RequestVote of Protocol.request_vote_input
+  (* Received a request vote response. *)
+  | RequestVoteOutput of Protocol.request_vote_output
+  (* Received an append entries request. *)
   | AppendEntries of Protocol.append_entries_input
+  (* Received an append entries response. *)
+  | AppendEntriesOutput of Protocol.append_entries_output
 [@@deriving show]
 
 (* Returns the term included in the message. *)
@@ -70,6 +90,9 @@ let term_of_input_message (message : input_message) : Protocol.term =
   match message with
   | RequestVote message -> message.term
   | AppendEntries message -> message.leader_term
+  | ElectionTimeoutFired -> invalid_arg "ElectionTimeoutFired"
+  | AppendEntriesOutput _ -> invalid_arg "AppendEntriesOutput"
+  | RequestVoteOutput _ -> invalid_arg "RequestVoteOutput"
 
 (* Returns the id the replica that sent the message. *)
 let replica_id_of_input_message (message : input_message) : Protocol.replica_id
@@ -77,27 +100,40 @@ let replica_id_of_input_message (message : input_message) : Protocol.replica_id
   match message with
   | RequestVote message -> message.candidate_id
   | AppendEntries message -> message.leader_id
+  | ElectionTimeoutFired -> invalid_arg "ElectionTimeoutFired"
+  | AppendEntriesOutput _ -> invalid_arg "AppendEntriesOutput"
+  | RequestVoteOutput _ -> invalid_arg "RequestVoteOutput"
 
 type output_message =
   | RequestVote of Protocol.request_vote_output
   | AppendEntries of Protocol.append_entries_output
 [@@deriving show]
 
-let create ~(transport : transport) ~(storage : storage)
+let create ~(id : Protocol.replica_id) ~(config : config)
+    ~(transport : transport) ~(storage : storage)
     ~(initial_state : initial_state) ~(fsm_apply : Protocol.entry -> unit) :
     replica =
   {
+    id;
+    config;
     persistent_state =
       {
         current_term = initial_state.current_term;
         voted_for = initial_state.voted_for;
       };
     volatile_state =
-      { state = Follower; commit_index = 0L; last_applied_index = 0L };
+      {
+        state = Follower;
+        commit_index = 0L;
+        last_applied_index = 0L;
+        election = { votes_received = ReplicaIdSet.empty };
+      };
     storage;
     transport;
     fsm_apply;
   }
+
+let majority (n : int) : int = (n / 2) + 1
 
 let has_voted_for_other_candidate (replica : replica)
     (candidate_id : replica_id) : bool =
@@ -110,7 +146,8 @@ let handle_request_vote (replica : replica) (message : request_vote_input) :
     request_vote_output =
   if message.term > replica.persistent_state.current_term then (
     replica.persistent_state.current_term <- message.term;
-    replica.volatile_state.state <- Follower);
+    replica.volatile_state.state <- Follower;
+    replica.persistent_state.voted_for <- None);
 
   let response : request_vote_output =
     if
@@ -121,14 +158,65 @@ let handle_request_vote (replica : replica) (message : request_vote_input) :
       (* If the candidate's last entry term is the same as our last entry term but our log has more entries *)
       || message.last_log_term = replica.storage.last_log_term ()
          && message.last_log_index < replica.storage.last_log_index ()
-    then { term = replica.persistent_state.current_term; vote_granted = false }
+    then
+      {
+        term = replica.persistent_state.current_term;
+        vote_granted = false;
+        replica_id = replica.id;
+      }
     else (
       replica.persistent_state.current_term <- message.term;
       replica.persistent_state.voted_for <- Some message.candidate_id;
-      { term = replica.persistent_state.current_term; vote_granted = true })
+      {
+        term = replica.persistent_state.current_term;
+        vote_granted = true;
+        replica_id = replica.id;
+      })
   in
   replica.storage.persist replica.persistent_state;
   response
+
+(* Handles a request vote output message.
+   Becomes leader and returns heartbeat messages if it received votes from a quorum. *)
+let handle_request_vote_output (replica : replica)
+    (message : request_vote_output) : append_entries_input list =
+  (* Ignore messages that are responses to older request vote requests. *)
+  if message.term <> replica.persistent_state.current_term then []
+  else (
+    if message.vote_granted then
+      replica.volatile_state.election <-
+        {
+          votes_received =
+            ReplicaIdSet.add message.replica_id
+              replica.volatile_state.election.votes_received;
+        };
+
+    (* If replica received votes from a quorum. *)
+    if
+      ReplicaIdSet.cardinal replica.volatile_state.election.votes_received
+      >= majority (List.length replica.config.cluster_members)
+    then (
+      (* Transition to leader. *)
+      replica.volatile_state.state <- Leader;
+
+      (* Return heartbeat messages. *)
+      List.filter_map
+        (fun replica_id ->
+          if replica_id != replica.id then
+            Some
+              {
+                leader_term = replica.persistent_state.current_term;
+                leader_id = replica.id;
+                replica_id;
+                (* TODO: are previous_log_index and previous_log_term correct here? *)
+                previous_log_index = replica.storage.last_log_index ();
+                previous_log_term = replica.storage.last_log_term ();
+                leader_commit = replica.volatile_state.commit_index;
+                entries = [];
+              }
+          else None)
+        replica.config.cluster_members)
+    else [])
 
 (* Applies unapplied entries to the state machine. *)
 let commit (replica : replica) : unit =
@@ -159,6 +247,7 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
   if message.leader_term > replica.persistent_state.current_term then (
     replica.persistent_state.current_term <- message.leader_term;
     replica.volatile_state.state <- Follower;
+    replica.persistent_state.voted_for <- None;
     replica.storage.persist replica.persistent_state);
 
   if
@@ -200,25 +289,57 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
     })
 
 let start_election (replica : replica) : request_vote_input list =
+  (* Start a new term. *)
   replica.persistent_state.current_term <-
-    replica.persistent_state.current_term + 1L;
-  (* votes_received starts at 1 because the candidate votes for itself. *)
-  replica.election <-
+    Int64.add replica.persistent_state.current_term 1L;
+  replica.persistent_state.voted_for <- None;
+  replica.storage.persist replica.persistent_state;
+
+  (* TODO: election timer? *)
+
+  (* votes_received starts with the candidate because it votes for itself. *)
+  replica.volatile_state.election <-
     { votes_received = ReplicaIdSet.add replica.id ReplicaIdSet.empty };
-  assert false
+
+  (* Return the massages that should be sent to the other members in the cluster. *)
+  List.filter_map
+    (fun replica_id ->
+      if replica_id != replica.id then
+        Some
+          {
+            term = replica.persistent_state.current_term;
+            candidate_id = replica.id;
+            replica_id;
+            last_log_index = replica.storage.last_log_index ();
+            last_log_term = replica.storage.last_log_term ();
+          }
+      else None)
+    replica.config.cluster_members
 
 let handle_message (replica : replica) (input_message : input_message) =
   match input_message with
+  | ElectionTimeoutFired ->
+      start_election replica
+      |> List.iter (fun (message : request_vote_input) ->
+             replica.transport.send_request_vote_input message.replica_id
+               message)
   | RequestVote message ->
       let output_message = handle_request_vote replica message in
       replica.transport.send_request_vote_output
         (replica_id_of_input_message input_message)
         output_message
+  | RequestVoteOutput message ->
+      handle_request_vote_output replica message
+      |> List.iter (fun message ->
+             replica.transport.send_append_entries_input message.replica_id
+               message)
   | AppendEntries message ->
       let output_message = handle_append_entries replica message in
       replica.transport.send_append_entries_output
         (replica_id_of_input_message input_message)
         output_message
+  | AppendEntriesOutput message ->
+      Printf.printf "received append entries output\n"
 
 (* Returns a Disk_storage instance which writes to a temp folder. *)
 let test_disk_storage ~(dir : string) : storage =
@@ -245,25 +366,85 @@ type test_replica = {
 }
 
 (* Returns a replica that can be used in tests. *)
-let test_replica ?(dir : string option) (initial_state : Protocol.initial_state)
-    : test_replica =
-  let noop_transport =
-    {
-      send_request_vote_output = (fun _ _ -> ());
-      send_append_entries_output = (fun _ _ -> ());
-    }
+let test_replica ?(replica_id : Protocol.replica_id option)
+    ?(config : config option) ?(dir : string option)
+    ?(transport : transport option) (initial_state : Protocol.initial_state) :
+    test_replica =
+  let transport =
+    match transport with
+    | None ->
+        (* no-op transport. *)
+        {
+          send_request_vote_input = (fun _ _ -> ());
+          send_request_vote_output = (fun _ _ -> ());
+          send_append_entries_input = (fun _ _ -> ());
+          send_append_entries_output = (fun _ _ -> ());
+        }
+    | Some v -> v
   in
 
+  let id = match replica_id with None -> 0 | Some v -> v in
+  let config =
+    match config with None -> { cluster_members = [] } | Some v -> v
+  in
   let dir = match dir with None -> Test_util.temp_dir () | Some v -> v in
   let storage = test_disk_storage ~dir in
   let kv = Hashtbl.create 0 in
   {
     storage_dir = dir;
     replica =
-      create ~transport:noop_transport ~storage ~initial_state
+      create ~id ~config ~transport ~storage ~initial_state
         ~fsm_apply:(fun entry -> Hashtbl.replace kv entry.data entry.data);
     kv;
   }
+
+(* Contains the replicas used for a cluster used for testing. *)
+type test_cluster = { replicas : test_replica list }
+
+(* Returns a cluster containing test replicas. *)
+let test_cluster () : test_cluster =
+  let num_replicas = 3 in
+
+  let replica_ids = List.init num_replicas (fun i -> i) in
+
+  let config = { cluster_members = replica_ids } in
+
+  let replica_map = Hashtbl.create num_replicas in
+
+  let transport =
+    {
+      send_request_vote_input =
+        (fun replica_id message ->
+          let replica = Hashtbl.find replica_map replica_id in
+          handle_message replica (RequestVote message));
+      send_request_vote_output =
+        (fun replica_id message ->
+          let replica = Hashtbl.find replica_map replica_id in
+          handle_message replica (RequestVoteOutput message));
+      send_append_entries_input =
+        (fun replica_id message ->
+          let replica = Hashtbl.find replica_map replica_id in
+          handle_message replica (AppendEntries message));
+      send_append_entries_output =
+        (fun replica_id message ->
+          let replica = Hashtbl.find replica_map replica_id in
+          handle_message replica (AppendEntriesOutput message));
+    }
+  in
+
+  let test_replicas =
+    replica_ids
+    |> List.map (fun replica_id ->
+           test_replica ~replica_id ~config ~transport
+             { current_term = 0L; voted_for = None })
+  in
+
+  List.iter
+    (fun test_replica ->
+      Hashtbl.replace replica_map test_replica.replica.id test_replica.replica)
+    test_replicas;
+
+  { replicas = test_replicas }
 
 let%test_unit "request vote: replica receives message with higher term -> \
                updates term, transitions to follower and resets voted for, \
@@ -272,9 +453,16 @@ let%test_unit "request vote: replica receives message with higher term -> \
   sut.replica.volatile_state.state <- Leader;
   let actual =
     handle_request_vote sut.replica
-      { term = 1L; candidate_id = 1; last_log_index = 1L; last_log_term = 0L }
+      {
+        term = 1L;
+        candidate_id = 1;
+        last_log_index = 1L;
+        last_log_term = 0L;
+        replica_id = 0;
+      }
   in
-  assert (actual = { term = 1L; vote_granted = true });
+  assert (
+    actual = { term = 1L; vote_granted = true; replica_id = sut.replica.id });
   assert (sut.replica.persistent_state.voted_for = Some 1);
   assert (sut.replica.persistent_state.current_term = 1L);
   assert (sut.replica.volatile_state.state = Follower);
@@ -293,8 +481,14 @@ let%test_unit "request vote: candidate term is not up to date -> do not grant \
 
   assert (
     handle_request_vote sut.replica
-      { term = 0L; candidate_id = 1; last_log_index = 0L; last_log_term = 0L }
-    = { term = 1L; vote_granted = false })
+      {
+        term = 0L;
+        candidate_id = 1;
+        last_log_index = 0L;
+        last_log_term = 0L;
+        replica_id = 0;
+      }
+    = { term = 1L; vote_granted = false; replica_id = sut.replica.id })
 
 let%test_unit "request vote: replica voted for someone else -> do not grant \
                vote" =
@@ -302,8 +496,14 @@ let%test_unit "request vote: replica voted for someone else -> do not grant \
 
   assert (
     handle_request_vote sut.replica
-      { term = 0L; candidate_id = 1; last_log_index = 0L; last_log_term = 0L }
-    = { term = 0L; vote_granted = false })
+      {
+        term = 0L;
+        candidate_id = 1;
+        last_log_index = 0L;
+        last_log_term = 0L;
+        replica_id = 0;
+      }
+    = { term = 0L; vote_granted = false; replica_id = sut.replica.id })
 
 let%test_unit "request vote: candidate's last log term is less than replica's \
                last log term -> do not grant vote" =
@@ -313,6 +513,7 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -322,8 +523,14 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
 
   assert (
     handle_request_vote sut.replica
-      { term = 2L; candidate_id = 2; last_log_index = 1L; last_log_term = 0L }
-    = { term = 2L; vote_granted = false })
+      {
+        term = 2L;
+        candidate_id = 2;
+        last_log_index = 1L;
+        last_log_term = 0L;
+        replica_id = 0;
+      }
+    = { term = 2L; vote_granted = false; replica_id = sut.replica.id })
 
 let%test_unit "request vote: same last log term but replica's last log index \
                is greater -> do not grant vote" =
@@ -335,6 +542,7 @@ let%test_unit "request vote: same last log term but replica's last log index \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
@@ -345,8 +553,14 @@ let%test_unit "request vote: same last log term but replica's last log index \
   (* Candidate requests vote but its log has only one entry and the replica's has two. *)
   assert (
     handle_request_vote sut.replica
-      { term = 2L; candidate_id = 2; last_log_index = 1L; last_log_term = 1L }
-    = { term = 2L; vote_granted = false })
+      {
+        term = 2L;
+        candidate_id = 2;
+        last_log_index = 1L;
+        last_log_term = 1L;
+        replica_id = 0;
+      }
+    = { term = 2L; vote_granted = false; replica_id = sut.replica.id })
 
 let%test_unit "request vote: replica persists decision to storage" =
   let sut = test_replica { current_term = 0L; voted_for = None } in
@@ -354,13 +568,62 @@ let%test_unit "request vote: replica persists decision to storage" =
   (* Replica should grant vote to candidate *)
   assert (
     handle_request_vote sut.replica
-      { term = 1L; candidate_id = 5; last_log_index = 4L; last_log_term = 2L }
-    = { term = 1L; vote_granted = true });
+      {
+        term = 1L;
+        candidate_id = 5;
+        last_log_index = 4L;
+        last_log_term = 2L;
+        replica_id = 0;
+      }
+    = { term = 1L; vote_granted = true; replica_id = sut.replica.id });
 
   (* Replica should know it voted in the candidate after restarting *)
   let sut = test_replica (sut.replica.storage.initial_state ()) in
 
   assert (sut.replica.persistent_state.voted_for = Some 5)
+
+let%test_unit "request vote output" =
+  (* Given a replica that started term 2 and an election. *)
+  let cluster = test_cluster () in
+  let sut = List.hd cluster.replicas in
+
+  sut.replica.persistent_state.current_term <- 2L;
+
+  (* Candidate voted for itself. *)
+  sut.replica.volatile_state.election.votes_received <-
+    ReplicaIdSet.add sut.replica.id ReplicaIdSet.empty;
+
+  (* Should ignore messages that don't contain the current term. *)
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 1L; replica_id = 1; vote_granted = true }
+    = []);
+
+  (* Receives a message from a replica that didn't grant the vote. *)
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 2L; replica_id = 2; vote_granted = false }
+    = []);
+
+  (* Receives a message from a replica that did grant the vote.
+     Candidate voted for itself and received vote from other replica. Should become leader.
+  *)
+  let message =
+    {
+      leader_term = sut.replica.persistent_state.current_term;
+      leader_id = sut.replica.id;
+      replica_id = 0;
+      previous_log_index = sut.replica.storage.last_log_index ();
+      previous_log_term = sut.replica.storage.last_log_term ();
+      leader_commit = sut.replica.volatile_state.commit_index;
+      entries = [];
+    }
+  in
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 2L; replica_id = 30; vote_granted = true }
+    = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
+  assert (sut.replica.volatile_state.state = Leader)
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
   let sut = test_replica { current_term = 1L; voted_for = None } in
@@ -369,6 +632,7 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
       {
         leader_term = 0L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [];
@@ -387,6 +651,7 @@ let%test_unit "append entries: message.previous_log_index > \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 1L;
         previous_log_term = 0L;
         entries = [];
@@ -405,6 +670,7 @@ let%test_unit "append entries: truncates log in conflict" =
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries =
@@ -423,6 +689,7 @@ let%test_unit "append entries: truncates log in conflict" =
       {
         leader_term = 2L;
         leader_id = 2;
+        replica_id = 0;
         previous_log_index = 2L;
         previous_log_term = 1L;
         entries =
@@ -446,6 +713,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 1L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "hello world" } ];
@@ -459,6 +727,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -472,6 +741,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 1L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "2" } ];
@@ -490,6 +760,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
@@ -503,6 +774,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 2L;
         previous_log_term = 1L;
         entries = [ { term = 1L; data = "3" } ];
@@ -521,6 +793,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 3L;
         previous_log_term = 1L;
         entries = [];
@@ -537,7 +810,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
 let%test_unit "append entries: message term > replica term, update own term \
                and transition to follower" =
   (* Given a replica in the Candidate state *)
-  let sut = test_replica { current_term = 0L; voted_for = None } in
+  let sut = test_replica { current_term = 0L; voted_for = Some 5 } in
   sut.replica.volatile_state.state <- Candidate;
 
   (* Replica receives a message with a term greater than its own *)
@@ -546,6 +819,7 @@ let%test_unit "append entries: message term > replica term, update own term \
       {
         leader_term = 1L;
         leader_id = 1;
+        replica_id = 0;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -564,3 +838,32 @@ let%test_unit "append entries: message term > replica term, update own term \
   assert (
     sut.replica.storage.initial_state ()
     = { current_term = 1L; voted_for = None })
+
+let%test_unit "start_election: starts new term / resets voted_for / returns a \
+               list of request vote message that should be sent to other \
+               replicas" =
+  let cluster = test_cluster () in
+  let sut = List.hd cluster.replicas in
+  let message =
+    {
+      term = 1L;
+      candidate_id = sut.replica.id;
+      last_log_index = 0L;
+      last_log_term = 0L;
+      replica_id = 0;
+    }
+  in
+  assert (sut.replica.id = 0);
+  assert (
+    start_election sut.replica
+    = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
+  assert (sut.replica.persistent_state = { current_term = 1L; voted_for = None })
+
+let%test_unit "handle_message: election timeout fired" =
+  (* Given a cluster with no leader and replicas at term 0. *)
+  let cluster = test_cluster () in
+  let sut = List.hd cluster.replicas in
+  (* A replica's election timeout fires and it sends request vote requests. *)
+  handle_message sut.replica ElectionTimeoutFired;
+  (* The replica becomes leader. *)
+  assert (sut.replica.volatile_state.state = Leader)

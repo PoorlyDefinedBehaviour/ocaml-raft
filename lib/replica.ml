@@ -249,8 +249,8 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
     append_entries_output =
   if message.leader_term > replica.persistent_state.current_term then (
     replica.persistent_state.current_term <- message.leader_term;
-    replica.volatile_state.state <- Follower;
     replica.persistent_state.voted_for <- None;
+    replica.volatile_state.state <- Follower;
     replica.storage.persist replica.persistent_state);
 
   if

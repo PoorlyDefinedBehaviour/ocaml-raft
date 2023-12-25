@@ -181,7 +181,10 @@ let handle_request_vote (replica : replica) (message : request_vote_input) :
 let handle_request_vote_output (replica : replica)
     (message : request_vote_output) : append_entries_input list =
   (* Ignore messages that are responses to older request vote requests. *)
-  if message.term <> replica.persistent_state.current_term then []
+  if
+    replica.volatile_state.state <> Candidate
+    || message.term <> replica.persistent_state.current_term
+  then []
   else (
     if message.vote_granted then
       replica.volatile_state.election <-
@@ -294,6 +297,7 @@ let start_election (replica : replica) : request_vote_input list =
     Int64.add replica.persistent_state.current_term 1L;
   replica.persistent_state.voted_for <- None;
   replica.storage.persist replica.persistent_state;
+  replica.volatile_state.state <- Candidate;
 
   (* TODO: election timer? *)
 
@@ -593,6 +597,16 @@ let%test_unit "request vote output" =
   sut.replica.volatile_state.election.votes_received <-
     ReplicaIdSet.add sut.replica.id ReplicaIdSet.empty;
 
+  (* Replica is not in the Candidate state. Ignores messages when not in the candidate state. *)
+  assert (sut.replica.volatile_state.state <> Candidate);
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 2L; replica_id = 2; vote_granted = true }
+    = []);
+
+  (* Transition to Candidate state. *)
+  sut.replica.volatile_state.state <- Candidate;
+
   (* Should ignore messages that don't contain the current term. *)
   assert (
     handle_request_vote_output sut.replica
@@ -839,9 +853,9 @@ let%test_unit "append entries: message term > replica term, update own term \
     sut.replica.storage.initial_state ()
     = { current_term = 1L; voted_for = None })
 
-let%test_unit "start_election: starts new term / resets voted_for / returns a \
-               list of request vote message that should be sent to other \
-               replicas" =
+let%test_unit "start_election: starts new term / transitions to candidate \
+               /resets voted_for / returns a list of request vote message that \
+               should be sent to other replicas" =
   let cluster = test_cluster () in
   let sut = List.hd cluster.replicas in
   let message =
@@ -857,7 +871,8 @@ let%test_unit "start_election: starts new term / resets voted_for / returns a \
   assert (
     start_election sut.replica
     = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
-  assert (sut.replica.persistent_state = { current_term = 1L; voted_for = None })
+  assert (sut.replica.persistent_state = { current_term = 1L; voted_for = None });
+  assert (sut.replica.volatile_state.state = Candidate)
 
 let%test_unit "handle_message: election timeout fired" =
   (* Given a cluster with no leader and replicas at term 0. *)

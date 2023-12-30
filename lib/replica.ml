@@ -141,13 +141,17 @@ let has_voted_for_other_candidate (replica : replica)
   | None -> false
   | Some replica_id -> replica_id <> candidate_id
 
+(* Called when a replica with a higher term is found. *)
+let transition_to_higher_term (replica : replica) (term : term) : unit =
+  replica.persistent_state.current_term <- term;
+  replica.volatile_state.state <- Follower;
+  replica.persistent_state.voted_for <- None
+
 (* TODO: reset election timeout when vote is granted *)
 let handle_request_vote (replica : replica) (message : request_vote_input) :
     request_vote_output =
-  if message.term > replica.persistent_state.current_term then (
-    replica.persistent_state.current_term <- message.term;
-    replica.volatile_state.state <- Follower;
-    replica.persistent_state.voted_for <- None);
+  if message.term > replica.persistent_state.current_term then
+    transition_to_higher_term replica message.term;
 
   let response : request_vote_output =
     if
@@ -291,6 +295,15 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       last_log_index = replica.storage.last_log_index ();
     })
 
+let handle_append_entries_output (replica : replica)
+    (message : Protocol.append_entries_output) : unit =
+  if message.term > replica.persistent_state.current_term then (
+    transition_to_higher_term replica message.term;
+    replica.storage.persist replica.persistent_state);
+
+  (* TODO *)
+  Printf.printf "got append entries output"
+
 let start_election (replica : replica) : request_vote_input list =
   (* Start a new term. *)
   replica.persistent_state.current_term <-
@@ -342,8 +355,9 @@ let handle_message (replica : replica) (input_message : input_message) =
       replica.transport.send_append_entries_output
         (replica_id_of_input_message input_message)
         output_message
-  | AppendEntriesOutput message ->
-      Printf.printf "received append entries output\n"
+  | AppendEntriesOutput message -> handle_append_entries_output replica message
+
+let start_and_loop (replica : replica) : unit = assert false
 
 (* Returns a Disk_storage instance which writes to a temp folder. *)
 let test_disk_storage ~(dir : string) : storage =

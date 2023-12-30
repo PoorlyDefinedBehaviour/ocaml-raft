@@ -63,7 +63,7 @@ type append_entries_output = {
   term : term;
   (* True if follower contained entry matching previous_log_index and previous_log_term *)
   success : bool;
-  (* The index of the last log entry in the replica *)
+  (* The index of the last log entry where the replica's log and the leader's log match. *)
   last_log_index : int64;
 }
 [@@deriving show]

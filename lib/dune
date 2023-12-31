@@ -3,7 +3,7 @@
  (inline_tests)
  (preprocess
   (pps ppx_inline_test ppx_assert ppx_deriving.show))
- (libraries uuidm core_unix checkseum))
+ (libraries uuidm core_unix checkseum eio))
 
 (env
  (dev

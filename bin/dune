@@ -1,4 +1,4 @@
 (executable
  (public_name ocaml_raft)
  (name main)
- (libraries raft))
+ (libraries raft eio eio_main))

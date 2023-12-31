@@ -49,6 +49,8 @@ type volatile_state = {
   mutable last_applied_index : int64;
   (* The state of the current election (If there's one) *)
   mutable election : election;
+  (* When the next election timeout will fire. *)
+  mutable election_timeout_at : Eio.Time.Mono.ty; [@opaque]
 }
 [@@deriving show]
 
@@ -357,7 +359,17 @@ let handle_message (replica : replica) (input_message : input_message) =
         output_message
   | AppendEntriesOutput message -> handle_append_entries_output replica message
 
-let start_and_loop (replica : replica) : unit = assert false
+let start_and_loop ~clock ~(replica : replica) : unit =
+  let rec go () : unit =
+    (* Eio.Time.Mono.sleep_until clock replica.volatile_state.election_timeout_at  *)
+    assert false
+  in
+  go ()
+
+(* Eio.Time.sleep_until  *)
+(* TODO: receive requests from clients and from replicas from a channel *)
+(* Eio.Time.sleep clock  *)
+(* assert false *)
 
 (* Returns a Disk_storage instance which writes to a temp folder. *)
 let test_disk_storage ~(dir : string) : storage =

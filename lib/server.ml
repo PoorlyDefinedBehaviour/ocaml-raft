@@ -4,7 +4,7 @@ let traceln fmt = traceln ("server: " ^^ fmt)
 let handle_client flow addr = assert false
 
 let start ~(sw : Eio.Switch.t) ~socket
-    ~(clock : float Eio.Time.clock_ty Eio.Resource.t) ~config ~transport
+    ~(clock : Mtime.t Eio.Time.clock_ty Eio.Resource.t) ~config ~transport
     ~storage ~fsm_apply =
   let replica =
     Replica.create ~sw ~clock ~config ~transport ~storage

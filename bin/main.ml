@@ -14,4 +14,4 @@ let main ~net ~clock =
 
 let () =
   Eio_main.run (fun env ->
-      main ~net:(Eio.Stdenv.net env) ~clock:(Eio.Stdenv.clock env))
+      main ~net:(Eio.Stdenv.net env) ~clock:(Eio.Stdenv.mono_clock env))

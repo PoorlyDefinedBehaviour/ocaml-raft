@@ -40,7 +40,15 @@ type election = {
 }
 [@@deriving show]
 
-type timeout = { at : Mtime.t; version : int64 } [@@deriving show]
+type timeout = {
+  at : Mtime.t;
+  (* The version is incremented every time a new timeout is created.
+     The version is used to find out if the timeout should be ignored because
+      a new timeout has been created. *)
+  version : int64;
+}
+[@@deriving show]
+
 type range = { min : int; max : int } [@@deriving show]
 
 type volatile_state = {
@@ -81,7 +89,9 @@ type replica = {
   (* The Eio switch. *)
   sw : Eio.Switch.t; [@opaque]
   (* The Eio clock. *)
-  clock : float Eio.Time.clock_ty Eio.Resource.t; [@opaque]
+  clock : Mtime.t Eio.Time.clock_ty Eio.Resource.t; [@opaque]
+  (* A random number generator. *)
+  random : Random.t;
 }
 [@@deriving show]
 
@@ -326,6 +336,8 @@ let handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
       match input_message with
       | ElectionTimeoutFired timeout ->
+          (* The timeout version will not be current timeout version
+             when the election timeout has been reset. *)
           if
             timeout.version
             = replica.volatile_state.next_election_timeout.version
@@ -352,18 +364,43 @@ let handle_message (replica : replica) (input_message : input_message) =
       | AppendEntriesOutput message ->
           handle_append_entries_output replica message)
 
-let random_election_timeout (range : range) : timeout = assert false
-let reset_election_timeout (replica : replica) : unit = assert false
-(* Eio.Fiber.fork ~sw:replica.sw (fun () ->
-    Eio.Time.Mono.sleep_until replica.clock
-      replica.volatile_state.next_election_timeout.at;
-    handle_message
-      (ElectionTimeoutFired replica.volatile_state.next_election_timeout)) *)
+let random_election_timeout (replica : replica) : timeout =
+  let now = Mtime_clock.now_ns () in
+  let timeout_at =
+    Int64.add now
+      ((* Convert from ms to ns because Mtime only works with ns. *)
+       Int64.mul
+         (replica.random.gen_range_int64
+            (* The election timeout config is in ms. *)
+            (Int64.of_int replica.config.election_timeout.min)
+            (Int64.of_int replica.config.election_timeout.max))
+         1_000_000L)
+  in
+
+  {
+    at = Mtime.of_uint64_ns timeout_at;
+    version = Int64.add replica.volatile_state.next_election_timeout.version 1L;
+  }
+
+let reset_election_timeout (replica : replica) : unit =
+  let timeout = random_election_timeout replica in
+
+  replica.volatile_state.next_election_timeout <- timeout;
+
+  Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
+      (* Sleep until until the moment the timeout should fire. *)
+      Eio.Time.Mono.sleep_until replica.clock
+        replica.volatile_state.next_election_timeout.at;
+
+      (* Let the replica that the timeout has fired. *)
+      handle_message replica (ElectionTimeoutFired timeout);
+
+      `Stop_daemon)
 
 let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : transport) ~(storage : storage)
-    ~(initial_state : initial_state) ~(fsm_apply : Protocol.entry -> unit) :
-    replica =
+    ~(initial_state : initial_state) ~(fsm_apply : Protocol.entry -> unit)
+    ~(random : Random.t) : replica =
   let replica =
     {
       config;
@@ -381,12 +418,12 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
           commit_index = 0L;
           last_applied_index = 0L;
           election = { votes_received = ReplicaIdSet.empty };
-          next_election_timeout =
-            random_election_timeout config.election_timeout;
+          next_election_timeout = { at = Mtime_clock.now (); version = 0L };
         };
       storage;
       transport;
       fsm_apply;
+      random;
     }
   in
   reset_election_timeout replica;
@@ -414,6 +451,10 @@ type test_replica = {
   replica : replica;
   (* A state machine used in tests. *)
   kv : (string, string) Hashtbl.t;
+  (* The Eio switch. *)
+  sw : Eio.Switch.t;
+  (* The Eio clock. *)
+  clock : Mtime.t Eio.Time.clock_ty Eio.Resource.t;
 }
 
 (* Returns a replica that can be used in tests. *)
@@ -452,12 +493,29 @@ let test_replica ~(sw : Eio.Switch.t) ~clock
     storage_dir = dir;
     replica =
       create ~sw ~clock ~config ~transport ~storage ~initial_state
-        ~fsm_apply:(fun entry -> Hashtbl.replace kv entry.data entry.data);
+        ~fsm_apply:(fun entry -> Hashtbl.replace kv entry.data entry.data)
+        ~random:(Random.create ());
     kv;
+    sw;
+    clock;
   }
 
+(* Instantiates a test replica and passes it to [f] *)
+let with_test_replica ?(dir : string option)
+    (initial_state : Protocol.initial_state) f =
+  let dir = match dir with None -> Test_util.temp_dir () | Some v -> v in
+
+  Eio_main.run (fun env ->
+      Eio.Switch.run (fun sw ->
+          let replica =
+            test_replica ~sw
+              ~clock:(Eio.Stdenv.mono_clock env)
+              ~dir initial_state
+          in
+          f replica))
+
 (* Contains the replicas used for a cluster used for testing. *)
-type test_cluster = { replicas : test_replica list }
+type test_cluster = { replicas : test_replica list; sw : Eio.Switch.t }
 
 (* Returns a cluster containing test replicas. *)
 let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
@@ -511,15 +569,19 @@ let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
         test_replica.replica)
     test_replicas;
 
-  { replicas = test_replicas }
+  { replicas = test_replicas; sw }
+
+(* Instantiates a test cluster and passes it to [f] *)
+let with_test_cluster f =
+  Eio_main.run (fun env ->
+      Eio.Switch.run (fun sw ->
+          let cluster = test_cluster ~sw ~clock:(Eio.Stdenv.mono_clock env) in
+          f cluster))
 
 let%test_unit "request vote: replica receives message with higher term -> \
                updates term, transitions to follower and resets voted for, \
                grants vote" =
-  let sut =
-    test_replica ~sw ~clock:(Eio.Stdenv.clock env)
-      { current_term = 0L; voted_for = None }
-  in
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
   sut.replica.volatile_state.state <- Leader;
   let actual =
     handle_request_vote sut.replica
@@ -540,7 +602,8 @@ let%test_unit "request vote: replica receives message with higher term -> \
 
   (* Ensure that the state change has been persisted to storage by restarting the replica. *)
   let sut =
-    test_replica ~dir:sut.storage_dir { current_term = 0L; voted_for = None }
+    test_replica ~sw:sut.sw ~clock:sut.clock ~dir:sut.storage_dir
+      { current_term = 0L; voted_for = None }
   in
   assert (
     sut.replica.storage.initial_state ()
@@ -548,8 +611,7 @@ let%test_unit "request vote: replica receives message with higher term -> \
 
 let%test_unit "request vote: candidate term is not up to date -> do not grant \
                vote" =
-  let sut = test_replica { current_term = 1L; voted_for = None } in
-
+  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
   assert (
     handle_request_vote sut.replica
       {
@@ -563,8 +625,7 @@ let%test_unit "request vote: candidate term is not up to date -> do not grant \
 
 let%test_unit "request vote: replica voted for someone else -> do not grant \
                vote" =
-  let sut = test_replica { current_term = 0L; voted_for = Some 10 } in
-
+  with_test_replica { current_term = 0L; voted_for = Some 10 } @@ fun sut ->
   assert (
     handle_request_vote sut.replica
       {
@@ -578,7 +639,7 @@ let%test_unit "request vote: replica voted for someone else -> do not grant \
 
 let%test_unit "request vote: candidate's last log term is less than replica's \
                last log term -> do not grant vote" =
-  let sut = test_replica { current_term = 0L; voted_for = Some 10 } in
+  with_test_replica { current_term = 0L; voted_for = Some 10 } @@ fun sut ->
   assert (
     handle_append_entries sut.replica
       {
@@ -605,8 +666,7 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
 
 let%test_unit "request vote: same last log term but replica's last log index \
                is greater -> do not grant vote" =
-  let sut = test_replica { current_term = 0L; voted_for = None } in
-
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
   (* Append two entries to the replica's log. *)
   assert (
     handle_append_entries sut.replica
@@ -634,8 +694,7 @@ let%test_unit "request vote: same last log term but replica's last log index \
     = { term = 2L; vote_granted = false; replica_id = sut.replica.config.id })
 
 let%test_unit "request vote: replica persists decision to storage" =
-  let sut = test_replica { current_term = 0L; voted_for = None } in
-
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
   (* Replica should grant vote to candidate *)
   assert (
     handle_request_vote sut.replica
@@ -649,13 +708,16 @@ let%test_unit "request vote: replica persists decision to storage" =
     = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
 
   (* Replica should know it voted in the candidate after restarting *)
-  let sut = test_replica (sut.replica.storage.initial_state ()) in
+  let sut =
+    test_replica ~sw:sut.sw ~clock:sut.clock
+      (sut.replica.storage.initial_state ())
+  in
 
   assert (sut.replica.persistent_state.voted_for = Some 5)
 
 let%test_unit "request vote output" =
   (* Given a replica that started term 2 and an election. *)
-  let cluster = test_cluster () in
+  with_test_cluster @@ fun cluster ->
   let sut = List.hd cluster.replicas in
 
   sut.replica.persistent_state.current_term <- 2L;
@@ -707,7 +769,7 @@ let%test_unit "request vote output" =
   assert (sut.replica.volatile_state.state = Leader)
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
-  let sut = test_replica { current_term = 1L; voted_for = None } in
+  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
   let actual =
     handle_append_entries sut.replica
       {
@@ -725,7 +787,7 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
 let%test_unit "append entries: message.previous_log_index > \
                replica.last_lost_index, reject request" =
   (* Replica with empty log. Last log index is 0. *)
-  let sut = test_replica { current_term = 0L; voted_for = None } in
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
   (* Leader thinks the index of previous log sent to this replica is 1. *)
   let actual =
     handle_append_entries sut.replica
@@ -743,8 +805,7 @@ let%test_unit "append entries: message.previous_log_index > \
   assert (actual = { term = 1L; success = false; last_log_index = 0L })
 
 let%test_unit "append entries: truncates log in conflict" =
-  let sut = test_replica { current_term = 0L; voted_for = None } in
-
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
   (* Leader appends some entries to the replica's log. *)
   assert (
     handle_append_entries sut.replica
@@ -786,8 +847,7 @@ let%test_unit "append entries: truncates log in conflict" =
 let%test_unit "append entries: log entry at previous_log_index does not match \
                previous_log_term should truncate log" =
   (* Replica with empty log. Last log index is 0. *)
-  let sut = test_replica { current_term = 0L; voted_for = None } in
-
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
   (* Replica's log is empty. Leader thinks the previous log entry at index 1. *)
   assert (
     handle_append_entries sut.replica
@@ -833,8 +893,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
 let%test_unit "append entries: leader commit index > replica commit index, \
                should update commit index" =
   (* Replica with empty log. Last log index is 0. *)
-  let sut = test_replica { current_term = 0L; voted_for = None } in
-
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
   (* Append some entries to the log. *)
   assert (
     handle_append_entries sut.replica
@@ -891,7 +950,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
 let%test_unit "append entries: message term > replica term, update own term \
                and transition to follower" =
   (* Given a replica in the Candidate state *)
-  let sut = test_replica { current_term = 0L; voted_for = Some 5 } in
+  with_test_replica { current_term = 0L; voted_for = Some 5 } @@ fun sut ->
   sut.replica.volatile_state.state <- Candidate;
 
   (* Replica receives a message with a term greater than its own *)
@@ -914,7 +973,8 @@ let%test_unit "append entries: message term > replica term, update own term \
 
   (* Ensure that the state change has been persisted to storage by restarting the replica. *)
   let sut =
-    test_replica ~dir:sut.storage_dir { current_term = 0L; voted_for = None }
+    test_replica ~sw:sut.sw ~clock:sut.clock ~dir:sut.storage_dir
+      { current_term = 0L; voted_for = None }
   in
   assert (
     sut.replica.storage.initial_state ()
@@ -923,7 +983,7 @@ let%test_unit "append entries: message term > replica term, update own term \
 let%test_unit "start_election: starts new term / transitions to candidate \
                /resets voted_for / returns a list of request vote message that \
                should be sent to other replicas" =
-  let cluster = test_cluster () in
+  with_test_cluster @@ fun cluster ->
   let sut = List.hd cluster.replicas in
   let message =
     {
@@ -943,9 +1003,10 @@ let%test_unit "start_election: starts new term / transitions to candidate \
 
 let%test_unit "handle_message: election timeout fired" =
   (* Given a cluster with no leader and replicas at term 0. *)
-  let cluster = test_cluster () in
+  with_test_cluster @@ fun cluster ->
   let sut = List.hd cluster.replicas in
   (* A replica's election timeout fires and it sends request vote requests. *)
-  handle_message sut.replica ElectionTimeoutFired;
+  handle_message sut.replica
+    (ElectionTimeoutFired { at = Mtime_clock.now (); version = 1L });
   (* The replica becomes leader. *)
   assert (sut.replica.volatile_state.state = Leader)

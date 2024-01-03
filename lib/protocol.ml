@@ -65,5 +65,7 @@ type append_entries_output = {
   success : bool;
   (* The index of the last log entry where the replica's log and the leader's log match. *)
   last_log_index : int64;
+  (* Replica sending the message. *)
+  replica_id : replica_id;
 }
 [@@deriving show]

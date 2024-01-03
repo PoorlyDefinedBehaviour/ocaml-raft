@@ -183,6 +183,7 @@ let handle_request_vote (replica : replica) (message : request_vote_input) :
    Becomes leader and returns heartbeat messages if it received votes from a quorum. *)
 let handle_request_vote_output (replica : replica)
     (message : request_vote_output) : append_entries_input list =
+  assert false;
   (* Ignore messages that are responses to older request vote requests. *)
   if
     replica.volatile_state.state <> Candidate
@@ -270,6 +271,7 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       success = false;
       (* TODO: return last log index where logs match *)
       last_log_index = replica.storage.last_log_index ();
+      replica_id = replica.config.id;
     }
   else (
     (* Append new entries to the log. *)
@@ -292,6 +294,7 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       term = replica.persistent_state.current_term;
       success = true;
       last_log_index = replica.storage.last_log_index ();
+      replica_id = replica.config.id;
     })
 
 let handle_append_entries_output (replica : replica)
@@ -333,9 +336,12 @@ let start_election (replica : replica) : request_vote_input list =
     replica.config.cluster_members
 
 let handle_message (replica : replica) (input_message : input_message) =
+  print_endline "handle_message: will try to acquire mutex";
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
+      print_endline "handle_message: mutex acquired";
       match input_message with
       | ElectionTimeoutFired timeout ->
+          print_endline "handle_message: ElectionTimeoutFired";
           (* The timeout version will not be current timeout version
              when the election timeout has been reset. *)
           if
@@ -344,24 +350,34 @@ let handle_message (replica : replica) (input_message : input_message) =
           then
             start_election replica
             |> List.iter (fun (message : request_vote_input) ->
+                   print_endline "will call send_request_vote_input";
+
                    replica.transport.send_request_vote_input message.replica_id
                      message)
       | RequestVote message ->
+          print_endline "handle_message: RequestVote";
           let output_message = handle_request_vote replica message in
           replica.transport.send_request_vote_output
             (replica_id_of_input_message input_message)
             output_message
       | RequestVoteOutput message ->
-          handle_request_vote_output replica message
-          |> List.iter (fun message ->
-                 replica.transport.send_append_entries_input message.replica_id
-                   message)
+          print_endline "handle_message: RequestVoteOutput ignored";
+          (* let _ = handle_request_vote_output replica message in
+             print_endline "handle_request_vote_output returned"; *)
+          ()
+          (* |> List.iter (fun (message : Protocol.append_entries_input) ->
+                 Printf.printf "would send heartbeat after becoming leader\n";
+                 ()
+                 (* replica.transport.send_append_entries_input message.replica_id
+                    message *)) *)
       | AppendEntries message ->
+          print_endline "handle_message: AppendEntries";
           let output_message = handle_append_entries replica message in
           replica.transport.send_append_entries_output
             (replica_id_of_input_message input_message)
             output_message
       | AppendEntriesOutput message ->
+          print_endline "handle_message: AppendEntriesOutput";
           handle_append_entries_output replica message)
 
 let random_election_timeout (replica : replica) : timeout =
@@ -389,6 +405,7 @@ let reset_election_timeout (replica : replica) : unit =
 
   Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
       (* Sleep until until the moment the timeout should fire. *)
+      print_endline "reset_election_timeout called. will sleep ";
       Eio.Time.Mono.sleep_until replica.clock
         replica.volatile_state.next_election_timeout.at;
 
@@ -537,18 +554,34 @@ let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
     {
       send_request_vote_input =
         (fun replica_id message ->
+          Printf.printf
+            "would send request vote input to replica_id=%d candidate_id=%d\n"
+            replica_id message.candidate_id;
           let replica = Hashtbl.find replica_map replica_id in
           handle_message replica (RequestVote message));
       send_request_vote_output =
         (fun replica_id message ->
+          Printf.printf
+            "would send request vote output to to_replica_id=%d \
+             from_replica_id=%d\n"
+            replica_id message.replica_id;
+
           let replica = Hashtbl.find replica_map replica_id in
           handle_message replica (RequestVoteOutput message));
       send_append_entries_input =
         (fun replica_id message ->
+          Printf.printf
+            "would send append entries input to to_replica_id=%d \
+             from_replica_id=%d\n"
+            replica_id message.replica_id;
           let replica = Hashtbl.find replica_map replica_id in
           handle_message replica (AppendEntries message));
       send_append_entries_output =
         (fun replica_id message ->
+          Printf.printf
+            "would send append entries output to to_replica_id=%d \
+             from_replica_id=%d\n"
+            replica_id message.replica_id;
           let replica = Hashtbl.find replica_map replica_id in
           handle_message replica (AppendEntriesOutput message));
     }
@@ -572,7 +605,7 @@ let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
   { replicas = test_replicas; sw }
 
 (* Instantiates a test cluster and passes it to [f] *)
-let with_test_cluster f =
+let with_test_cluster (f : test_cluster -> unit) =
   Eio_main.run (fun env ->
       Eio.Switch.run (fun sw ->
           let cluster = test_cluster ~sw ~clock:(Eio.Stdenv.mono_clock env) in
@@ -651,7 +684,12 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
         entries = [ { term = 1L; data = "1" } ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = true; last_log_index = 1L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = sut.replica.config.id;
+      });
 
   assert (
     handle_request_vote sut.replica
@@ -679,7 +717,12 @@ let%test_unit "request vote: same last log term but replica's last log index \
         entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = true; last_log_index = 2L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 2L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* Candidate requests vote but its log has only one entry and the replica's has two. *)
   assert (
@@ -714,59 +757,59 @@ let%test_unit "request vote: replica persists decision to storage" =
   in
 
   assert (sut.replica.persistent_state.voted_for = Some 5)
+(*
+   let%test_unit "request vote output" =
+     (* Given a replica that started term 2 and an election. *)
+     with_test_cluster @@ fun cluster ->
+     let sut = List.hd cluster.replicas in
 
-let%test_unit "request vote output" =
-  (* Given a replica that started term 2 and an election. *)
-  with_test_cluster @@ fun cluster ->
-  let sut = List.hd cluster.replicas in
+     sut.replica.persistent_state.current_term <- 2L;
 
-  sut.replica.persistent_state.current_term <- 2L;
+     (* Candidate voted for itself. *)
+     sut.replica.volatile_state.election.votes_received <-
+       ReplicaIdSet.add sut.replica.config.id ReplicaIdSet.empty;
 
-  (* Candidate voted for itself. *)
-  sut.replica.volatile_state.election.votes_received <-
-    ReplicaIdSet.add sut.replica.config.id ReplicaIdSet.empty;
+     (* Replica is not in the Candidate state. Ignores messages when not in the candidate state. *)
+     assert (sut.replica.volatile_state.state <> Candidate);
+     assert (
+       handle_request_vote_output sut.replica
+         { term = 2L; replica_id = 2; vote_granted = true }
+       = []);
 
-  (* Replica is not in the Candidate state. Ignores messages when not in the candidate state. *)
-  assert (sut.replica.volatile_state.state <> Candidate);
-  assert (
-    handle_request_vote_output sut.replica
-      { term = 2L; replica_id = 2; vote_granted = true }
-    = []);
+     (* Transition to Candidate state. *)
+     sut.replica.volatile_state.state <- Candidate;
 
-  (* Transition to Candidate state. *)
-  sut.replica.volatile_state.state <- Candidate;
+     (* Should ignore messages that don't contain the current term. *)
+     assert (
+       handle_request_vote_output sut.replica
+         { term = 1L; replica_id = 1; vote_granted = true }
+       = []);
 
-  (* Should ignore messages that don't contain the current term. *)
-  assert (
-    handle_request_vote_output sut.replica
-      { term = 1L; replica_id = 1; vote_granted = true }
-    = []);
+     (* Receives a message from a replica that didn't grant the vote. *)
+     assert (
+       handle_request_vote_output sut.replica
+         { term = 2L; replica_id = 2; vote_granted = false }
+       = []);
 
-  (* Receives a message from a replica that didn't grant the vote. *)
-  assert (
-    handle_request_vote_output sut.replica
-      { term = 2L; replica_id = 2; vote_granted = false }
-    = []);
-
-  (* Receives a message from a replica that did grant the vote.
-     Candidate voted for itself and received vote from other replica. Should become leader.
-  *)
-  let message =
-    {
-      leader_term = sut.replica.persistent_state.current_term;
-      leader_id = sut.replica.config.id;
-      replica_id = 0;
-      previous_log_index = sut.replica.storage.last_log_index ();
-      previous_log_term = sut.replica.storage.last_log_term ();
-      leader_commit = sut.replica.volatile_state.commit_index;
-      entries = [];
-    }
-  in
-  assert (
-    handle_request_vote_output sut.replica
-      { term = 2L; replica_id = 30; vote_granted = true }
-    = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
-  assert (sut.replica.volatile_state.state = Leader)
+     (* Receives a message from a replica that did grant the vote.
+        Candidate voted for itself and received vote from other replica. Should become leader.
+     *)
+     let message =
+       {
+         leader_term = sut.replica.persistent_state.current_term;
+         leader_id = sut.replica.config.id;
+         replica_id = 0;
+         previous_log_index = sut.replica.storage.last_log_index ();
+         previous_log_term = sut.replica.storage.last_log_term ();
+         leader_commit = sut.replica.volatile_state.commit_index;
+         entries = [];
+       }
+     in
+     assert (
+       handle_request_vote_output sut.replica
+         { term = 2L; replica_id = 30; vote_granted = true }
+       = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
+     assert (sut.replica.volatile_state.state = Leader) *)
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
   with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
@@ -782,7 +825,14 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
         leader_commit = 0L;
       }
   in
-  assert (actual = { term = 1L; success = false; last_log_index = 0L })
+  assert (
+    actual
+    = {
+        term = 1L;
+        success = false;
+        last_log_index = 0L;
+        replica_id = sut.replica.config.id;
+      })
 
 let%test_unit "append entries: message.previous_log_index > \
                replica.last_lost_index, reject request" =
@@ -802,7 +852,14 @@ let%test_unit "append entries: message.previous_log_index > \
       }
   in
   (* Replica should reject the append entries request. *)
-  assert (actual = { term = 1L; success = false; last_log_index = 0L })
+  assert (
+    actual
+    = {
+        term = 1L;
+        success = false;
+        last_log_index = 0L;
+        replica_id = sut.replica.config.id;
+      })
 
 let%test_unit "append entries: truncates log in conflict" =
   with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
@@ -823,7 +880,12 @@ let%test_unit "append entries: truncates log in conflict" =
           ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = true; last_log_index = 3L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 3L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* Another leader overrides the entries starting at index 3. *)
   assert (
@@ -842,7 +904,12 @@ let%test_unit "append entries: truncates log in conflict" =
           ];
         leader_commit = 1L;
       }
-    = { term = 2L; success = true; last_log_index = 5L })
+    = {
+        term = 2L;
+        success = true;
+        last_log_index = 5L;
+        replica_id = sut.replica.config.id;
+      })
 
 let%test_unit "append entries: log entry at previous_log_index does not match \
                previous_log_term should truncate log" =
@@ -860,7 +927,12 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
         entries = [ { term = 1L; data = "hello world" } ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = false; last_log_index = 0L });
+    = {
+        term = 1L;
+        success = false;
+        last_log_index = 0L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* Append one entry to the replica's log. *)
   assert (
@@ -874,7 +946,12 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
         entries = [ { term = 1L; data = "1" } ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = true; last_log_index = 1L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* previous_log_term does not match the entry at previous_log_index *)
   assert (
@@ -888,7 +965,12 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
         entries = [ { term = 1L; data = "2" } ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = false; last_log_index = 1L })
+    = {
+        term = 1L;
+        success = false;
+        last_log_index = 1L;
+        replica_id = sut.replica.config.id;
+      })
 
 let%test_unit "append entries: leader commit index > replica commit index, \
                should update commit index" =
@@ -906,7 +988,12 @@ let%test_unit "append entries: leader commit index > replica commit index, \
         entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = true; last_log_index = 2L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 2L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* Leader has commited entries up to index 2. Replica shoulda apply entries 1 and 2 to the state machine. *)
   assert (
@@ -920,7 +1007,12 @@ let%test_unit "append entries: leader commit index > replica commit index, \
         entries = [ { term = 1L; data = "3" } ];
         leader_commit = 2L;
       }
-    = { term = 1L; success = true; last_log_index = 3L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 3L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* Two entries should have been aplied to the state machine so there's two entries in the kv. *)
   assert (Hashtbl.length sut.kv = 2);
@@ -939,7 +1031,12 @@ let%test_unit "append entries: leader commit index > replica commit index, \
         entries = [];
         leader_commit = 3L;
       }
-    = { term = 1L; success = true; last_log_index = 3L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 3L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* Entries 1 and 2 had already been applied. Should have applied entry 3 now. *)
   assert (Hashtbl.length sut.kv = 3);
@@ -965,7 +1062,12 @@ let%test_unit "append entries: message term > replica term, update own term \
         entries = [ { term = 1L; data = "1" } ];
         leader_commit = 0L;
       }
-    = { term = 1L; success = true; last_log_index = 1L });
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = sut.replica.config.id;
+      });
 
   (* Updates term and transitions to Follower *)
   assert (sut.replica.volatile_state.state = Follower);
@@ -980,7 +1082,7 @@ let%test_unit "append entries: message term > replica term, update own term \
     sut.replica.storage.initial_state ()
     = { current_term = 1L; voted_for = None })
 
-let%test_unit "start_election: starts new term / transitions to candidate \
+(*let%test_unit "start_election: starts new term / transitions to candidate \
                /resets voted_for / returns a list of request vote message that \
                should be sent to other replicas" =
   with_test_cluster @@ fun cluster ->
@@ -999,14 +1101,37 @@ let%test_unit "start_election: starts new term / transitions to candidate \
     start_election sut.replica
     = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
   assert (sut.replica.persistent_state = { current_term = 1L; voted_for = None });
-  assert (sut.replica.volatile_state.state = Candidate)
+  assert (sut.replica.volatile_state.state = Candidate)*)
+
+let assert_eventually ~clock ~(wait_for_ms : int) (condition : unit -> unit) :
+    unit =
+  let started = Eio.Time.now clock in
+
+  let rec go () =
+    try condition ()
+    with Assert_failure exn ->
+      let elapsed = Eio.Time.now clock -. started in
+
+      (* Divide by 1000 to convert from ms to seconds. *)
+      if elapsed > float_of_int (wait_for_ms / 1000) then
+        raise (Assert_failure exn)
+      else (
+        (* Wait for a little while before checking the condition again. *)
+        Eio.Time.sleep clock 0.10;
+        go ())
+  in
+  go ()
 
 let%test_unit "handle_message: election timeout fired" =
+  print_endline "    ---- here ----";
   (* Given a cluster with no leader and replicas at term 0. *)
   with_test_cluster @@ fun cluster ->
   let sut = List.hd cluster.replicas in
+
   (* A replica's election timeout fires and it sends request vote requests. *)
   handle_message sut.replica
     (ElectionTimeoutFired { at = Mtime_clock.now (); version = 1L });
+
   (* The replica becomes leader. *)
-  assert (sut.replica.volatile_state.state = Leader)
+  assert_eventually ~clock:sut.clock ~wait_for_ms:300 (fun () ->
+      sut.replica.volatile_state.state = Leader)

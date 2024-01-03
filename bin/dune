@@ -2,3 +2,8 @@
  (public_name ocaml_raft)
  (name main)
  (libraries raft eio eio_main))
+
+(env
+ (dev
+  (flags
+   (:standard -warn-error -A))))

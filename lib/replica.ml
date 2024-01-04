@@ -1129,14 +1129,14 @@ let%test_unit "append entries: message term > replica term, update own term \
 
 let%test_unit "append entries: resets election timeout when request succeeds" =
   (* Given a replica in the Candidate state *)
-  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
   let timeout = sut.replica.volatile_state.next_election_timeout in
 
-  (* Replica receives an AppendEntries request from the leader. *)
+  (* Receives a request from a replica with a smaller term, should reject it. *)
   assert (
     handle_append_entries sut.replica
       {
-        leader_term = 1L;
+        leader_term = 0L;
         leader_id = 1;
         replica_id = 0;
         previous_log_index = 0L;
@@ -1146,6 +1146,29 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
       }
     = {
         term = 1L;
+        success = false;
+        last_log_index = 0L;
+        replica_id = sut.replica.config.id;
+      });
+
+  (* Replica should not have reset the election timeout. *)
+  assert (
+    timeout.version = sut.replica.volatile_state.next_election_timeout.version);
+
+  (* Replica receives an AppendEntries request from the leader. *)
+  assert (
+    handle_append_entries sut.replica
+      {
+        leader_term = 2L;
+        leader_id = 2;
+        replica_id = 0;
+        previous_log_index = 0L;
+        previous_log_term = 0L;
+        entries = [ { term = 1L; data = "1" } ];
+        leader_commit = 0L;
+      }
+    = {
+        term = 2L;
         success = true;
         last_log_index = 1L;
         replica_id = sut.replica.config.id;

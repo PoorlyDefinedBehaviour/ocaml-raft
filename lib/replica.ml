@@ -739,19 +739,36 @@ let%test_unit "request vote: replica persists decision to storage" =
   assert (sut.replica.persistent_state.voted_for = Some 5)
 
 let%test_unit "request vote: resets election timeout when vote is granted" =
-  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
   let timeout = sut.replica.volatile_state.next_election_timeout in
+
+  (* Does not reset the election timeout when vote is not granted. *)
+  assert (
+    handle_request_vote sut.replica
+      {
+        term = 0L;
+        candidate_id = 5;
+        last_log_index = 0L;
+        last_log_term = 0L;
+        replica_id = 2;
+      }
+    = { term = 1L; vote_granted = false; replica_id = sut.replica.config.id });
+
+  (* Should not reset. *)
+  assert (
+    timeout.version = sut.replica.volatile_state.next_election_timeout.version);
+
   (* Replica should grant vote. *)
   assert (
     handle_request_vote sut.replica
       {
-        term = 1L;
+        term = 2L;
         candidate_id = 5;
         last_log_index = 4L;
         last_log_term = 2L;
         replica_id = 3;
       }
-    = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
+    = { term = 2L; vote_granted = true; replica_id = sut.replica.config.id });
 
   (* Should reset the election timeout. *)
   assert (

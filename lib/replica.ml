@@ -146,44 +146,10 @@ let transition_to_higher_term (replica : replica) (term : term) : unit =
   replica.volatile_state.state <- Follower;
   replica.persistent_state.voted_for <- None
 
-(* TODO: reset election timeout when vote is granted *)
-let handle_request_vote (replica : replica) (message : request_vote_input) :
-    request_vote_output =
-  if message.term > replica.persistent_state.current_term then
-    transition_to_higher_term replica message.term;
-
-  let response : request_vote_output =
-    if
-      message.term < replica.persistent_state.current_term
-      || has_voted_for_other_candidate replica message.candidate_id
-      (* If the candidate's last entry term is less than our last entry term *)
-      || message.last_log_term < replica.storage.last_log_term ()
-      (* If the candidate's last entry term is the same as our last entry term but our log has more entries *)
-      || message.last_log_term = replica.storage.last_log_term ()
-         && message.last_log_index < replica.storage.last_log_index ()
-    then
-      {
-        term = replica.persistent_state.current_term;
-        vote_granted = false;
-        replica_id = replica.config.id;
-      }
-    else (
-      replica.persistent_state.current_term <- message.term;
-      replica.persistent_state.voted_for <- Some message.candidate_id;
-      {
-        term = replica.persistent_state.current_term;
-        vote_granted = true;
-        replica_id = replica.config.id;
-      })
-  in
-  replica.storage.persist replica.persistent_state;
-  response
-
 (* Handles a request vote output message.
    Becomes leader and returns heartbeat messages if it received votes from a quorum. *)
 let handle_request_vote_output (replica : replica)
     (message : request_vote_output) : append_entries_input list =
-  assert false;
   (* Ignore messages that are responses to older request vote requests. *)
   if
     replica.volatile_state.state <> Candidate
@@ -248,8 +214,68 @@ let commit (replica : replica) : unit =
   | Break -> ()
   | exn -> raise exn
 
-(* TODO: reset election timer *)
-let handle_append_entries (replica : replica) (message : append_entries_input) :
+let handle_append_entries_output (replica : replica)
+    (message : Protocol.append_entries_output) : unit =
+  if message.term > replica.persistent_state.current_term then (
+    transition_to_higher_term replica message.term;
+    replica.storage.persist replica.persistent_state);
+
+  (* TODO *)
+  Printf.printf "TODO: got append entries output"
+
+(* Returns a timeout with a new version and the timeout time somewhere in the timeout range. *)
+let random_election_timeout (replica : replica) : timeout =
+  let now = Mtime_clock.now_ns () in
+  let timeout_at =
+    Int64.add now
+      ((* Convert from ms to ns because Mtime only works with ns. *)
+       Int64.mul
+         (replica.random.gen_range_int64
+            (* The election timeout config is in ms. *)
+            (Int64.of_int replica.config.election_timeout.min)
+            (Int64.of_int replica.config.election_timeout.max))
+         1_000_000L)
+  in
+
+  {
+    at = Mtime.of_uint64_ns timeout_at;
+    version = Int64.add replica.volatile_state.next_election_timeout.version 1L;
+  }
+
+let rec handle_request_vote (replica : replica) (message : request_vote_input) :
+    request_vote_output =
+  if message.term > replica.persistent_state.current_term then
+    transition_to_higher_term replica message.term;
+
+  let response : request_vote_output =
+    if
+      message.term < replica.persistent_state.current_term
+      || has_voted_for_other_candidate replica message.candidate_id
+      (* If the candidate's last entry term is less than our last entry term *)
+      || message.last_log_term < replica.storage.last_log_term ()
+      (* If the candidate's last entry term is the same as our last entry term but our log has more entries *)
+      || message.last_log_term = replica.storage.last_log_term ()
+         && message.last_log_index < replica.storage.last_log_index ()
+    then
+      {
+        term = replica.persistent_state.current_term;
+        vote_granted = false;
+        replica_id = replica.config.id;
+      }
+    else (
+      replica.persistent_state.current_term <- message.term;
+      replica.persistent_state.voted_for <- Some message.candidate_id;
+      {
+        term = replica.persistent_state.current_term;
+        vote_granted = true;
+        replica_id = replica.config.id;
+      })
+  in
+  replica.storage.persist replica.persistent_state;
+  if response.vote_granted then reset_election_timeout replica;
+  response
+
+and handle_append_entries (replica : replica) (message : append_entries_input) :
     append_entries_output =
   if message.leader_term > replica.persistent_state.current_term then (
     replica.persistent_state.current_term <- message.leader_term;
@@ -290,6 +316,8 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       > replica.volatile_state.last_applied_index
     then commit replica;
 
+    reset_election_timeout replica;
+
     {
       term = replica.persistent_state.current_term;
       success = true;
@@ -297,16 +325,7 @@ let handle_append_entries (replica : replica) (message : append_entries_input) :
       replica_id = replica.config.id;
     })
 
-let handle_append_entries_output (replica : replica)
-    (message : Protocol.append_entries_output) : unit =
-  if message.term > replica.persistent_state.current_term then (
-    transition_to_higher_term replica message.term;
-    replica.storage.persist replica.persistent_state);
-
-  (* TODO *)
-  Printf.printf "got append entries output"
-
-let start_election (replica : replica) : request_vote_input list =
+and start_election (replica : replica) : request_vote_input list =
   (* Start a new term. *)
   replica.persistent_state.current_term <-
     Int64.add replica.persistent_state.current_term 1L;
@@ -314,7 +333,7 @@ let start_election (replica : replica) : request_vote_input list =
   replica.storage.persist replica.persistent_state;
   replica.volatile_state.state <- Candidate;
 
-  (* TODO: election timer? *)
+  reset_election_timeout replica;
 
   (* votes_received starts with the candidate because it votes for itself. *)
   replica.volatile_state.election <-
@@ -335,13 +354,26 @@ let start_election (replica : replica) : request_vote_input list =
       else None)
     replica.config.cluster_members
 
-let handle_message (replica : replica) (input_message : input_message) =
-  print_endline "handle_message: will try to acquire mutex";
+and reset_election_timeout (replica : replica) : unit =
+  let timeout = random_election_timeout replica in
+
+  replica.volatile_state.next_election_timeout <- timeout;
+
+  (* Spawning a fiber for each timeout is not necessary but I don't wanna spend more time on this project. *)
+  Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
+      (* Sleep until until the moment the timeout should fire. *)
+      Eio.Time.Mono.sleep_until replica.clock
+        replica.volatile_state.next_election_timeout.at;
+
+      (* Let the replica that the timeout has fired. *)
+      handle_message replica (ElectionTimeoutFired timeout);
+
+      `Stop_daemon)
+
+and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
-      print_endline "handle_message: mutex acquired";
       match input_message with
       | ElectionTimeoutFired timeout ->
-          print_endline "handle_message: ElectionTimeoutFired";
           (* The timeout version will not be current timeout version
              when the election timeout has been reset. *)
           if
@@ -350,69 +382,25 @@ let handle_message (replica : replica) (input_message : input_message) =
           then
             start_election replica
             |> List.iter (fun (message : request_vote_input) ->
-                   print_endline "will call send_request_vote_input";
-
                    replica.transport.send_request_vote_input message.replica_id
                      message)
       | RequestVote message ->
-          print_endline "handle_message: RequestVote";
           let output_message = handle_request_vote replica message in
           replica.transport.send_request_vote_output
             (replica_id_of_input_message input_message)
             output_message
       | RequestVoteOutput message ->
-          print_endline "handle_message: RequestVoteOutput ignored";
-          (* let _ = handle_request_vote_output replica message in
-             print_endline "handle_request_vote_output returned"; *)
-          ()
-          (* |> List.iter (fun (message : Protocol.append_entries_input) ->
-                 Printf.printf "would send heartbeat after becoming leader\n";
-                 ()
-                 (* replica.transport.send_append_entries_input message.replica_id
-                    message *)) *)
+          handle_request_vote_output replica message
+          |> List.iter (fun (message : Protocol.append_entries_input) ->
+                 replica.transport.send_append_entries_input message.replica_id
+                   message)
       | AppendEntries message ->
-          print_endline "handle_message: AppendEntries";
           let output_message = handle_append_entries replica message in
           replica.transport.send_append_entries_output
             (replica_id_of_input_message input_message)
             output_message
       | AppendEntriesOutput message ->
-          print_endline "handle_message: AppendEntriesOutput";
           handle_append_entries_output replica message)
-
-let random_election_timeout (replica : replica) : timeout =
-  let now = Mtime_clock.now_ns () in
-  let timeout_at =
-    Int64.add now
-      ((* Convert from ms to ns because Mtime only works with ns. *)
-       Int64.mul
-         (replica.random.gen_range_int64
-            (* The election timeout config is in ms. *)
-            (Int64.of_int replica.config.election_timeout.min)
-            (Int64.of_int replica.config.election_timeout.max))
-         1_000_000L)
-  in
-
-  {
-    at = Mtime.of_uint64_ns timeout_at;
-    version = Int64.add replica.volatile_state.next_election_timeout.version 1L;
-  }
-
-let reset_election_timeout (replica : replica) : unit =
-  let timeout = random_election_timeout replica in
-
-  replica.volatile_state.next_election_timeout <- timeout;
-
-  Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
-      (* Sleep until until the moment the timeout should fire. *)
-      print_endline "reset_election_timeout called. will sleep ";
-      Eio.Time.Mono.sleep_until replica.clock
-        replica.volatile_state.next_election_timeout.at;
-
-      (* Let the replica that the timeout has fired. *)
-      handle_message replica (ElectionTimeoutFired timeout);
-
-      `Stop_daemon)
 
 let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : transport) ~(storage : storage)
@@ -532,7 +520,7 @@ let with_test_replica ?(dir : string option)
           f replica))
 
 (* Contains the replicas used for a cluster used for testing. *)
-type test_cluster = { replicas : test_replica list; sw : Eio.Switch.t }
+type test_cluster = { sw : Eio.Switch.t; replicas : test_replica list }
 
 (* Returns a cluster containing test replicas. *)
 let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
@@ -554,36 +542,28 @@ let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
     {
       send_request_vote_input =
         (fun replica_id message ->
-          Printf.printf
-            "would send request vote input to replica_id=%d candidate_id=%d\n"
-            replica_id message.candidate_id;
-          let replica = Hashtbl.find replica_map replica_id in
-          handle_message replica (RequestVote message));
+          Eio.Fiber.fork_daemon ~sw (fun () ->
+              let replica = Hashtbl.find replica_map replica_id in
+              handle_message replica (RequestVote message);
+              `Stop_daemon));
       send_request_vote_output =
         (fun replica_id message ->
-          Printf.printf
-            "would send request vote output to to_replica_id=%d \
-             from_replica_id=%d\n"
-            replica_id message.replica_id;
-
-          let replica = Hashtbl.find replica_map replica_id in
-          handle_message replica (RequestVoteOutput message));
+          Eio.Fiber.fork_daemon ~sw (fun () ->
+              let replica = Hashtbl.find replica_map replica_id in
+              handle_message replica (RequestVoteOutput message);
+              `Stop_daemon));
       send_append_entries_input =
         (fun replica_id message ->
-          Printf.printf
-            "would send append entries input to to_replica_id=%d \
-             from_replica_id=%d\n"
-            replica_id message.replica_id;
-          let replica = Hashtbl.find replica_map replica_id in
-          handle_message replica (AppendEntries message));
+          Eio.Fiber.fork_daemon ~sw (fun () ->
+              let replica = Hashtbl.find replica_map replica_id in
+              handle_message replica (AppendEntries message);
+              `Stop_daemon));
       send_append_entries_output =
         (fun replica_id message ->
-          Printf.printf
-            "would send append entries output to to_replica_id=%d \
-             from_replica_id=%d\n"
-            replica_id message.replica_id;
-          let replica = Hashtbl.find replica_map replica_id in
-          handle_message replica (AppendEntriesOutput message));
+          Eio.Fiber.fork_daemon ~sw (fun () ->
+              let replica = Hashtbl.find replica_map replica_id in
+              handle_message replica (AppendEntriesOutput message);
+              `Stop_daemon));
     }
   in
 
@@ -602,7 +582,7 @@ let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
         test_replica.replica)
     test_replicas;
 
-  { replicas = test_replicas; sw }
+  { sw; replicas = test_replicas }
 
 (* Instantiates a test cluster and passes it to [f] *)
 let with_test_cluster (f : test_cluster -> unit) =
@@ -746,7 +726,7 @@ let%test_unit "request vote: replica persists decision to storage" =
         candidate_id = 5;
         last_log_index = 4L;
         last_log_term = 2L;
-        replica_id = 0;
+        replica_id = 3;
       }
     = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
 
@@ -757,59 +737,107 @@ let%test_unit "request vote: replica persists decision to storage" =
   in
 
   assert (sut.replica.persistent_state.voted_for = Some 5)
-(*
-   let%test_unit "request vote output" =
-     (* Given a replica that started term 2 and an election. *)
-     with_test_cluster @@ fun cluster ->
-     let sut = List.hd cluster.replicas in
 
-     sut.replica.persistent_state.current_term <- 2L;
+let%test_unit "request vote: resets election timeout when vote is granted" =
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  let timeout = sut.replica.volatile_state.next_election_timeout in
+  (* Replica should grant vote. *)
+  assert (
+    handle_request_vote sut.replica
+      {
+        term = 1L;
+        candidate_id = 5;
+        last_log_index = 4L;
+        last_log_term = 2L;
+        replica_id = 3;
+      }
+    = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
 
-     (* Candidate voted for itself. *)
-     sut.replica.volatile_state.election.votes_received <-
-       ReplicaIdSet.add sut.replica.config.id ReplicaIdSet.empty;
+  (* Should reset the election timeout. *)
+  assert (
+    Int64.add 1L timeout.version
+    = sut.replica.volatile_state.next_election_timeout.version)
 
-     (* Replica is not in the Candidate state. Ignores messages when not in the candidate state. *)
-     assert (sut.replica.volatile_state.state <> Candidate);
-     assert (
-       handle_request_vote_output sut.replica
-         { term = 2L; replica_id = 2; vote_granted = true }
-       = []);
+let%test_unit "request vote: grants vote to same candidate if the same message \
+               is received twice" =
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  (* Replica should grant vote to candidate when the first message is received. *)
+  assert (
+    handle_request_vote sut.replica
+      {
+        term = 1L;
+        candidate_id = 5;
+        last_log_index = 4L;
+        last_log_term = 2L;
+        replica_id = 3;
+      }
+    = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
 
-     (* Transition to Candidate state. *)
-     sut.replica.volatile_state.state <- Candidate;
+  (* Replica should grant vote to the same candidate again
+     when the same message is received more than once in the same term. *)
+  assert (
+    handle_request_vote sut.replica
+      {
+        term = 1L;
+        candidate_id = 5;
+        last_log_index = 4L;
+        last_log_term = 2L;
+        replica_id = 3;
+      }
+    = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id })
 
-     (* Should ignore messages that don't contain the current term. *)
-     assert (
-       handle_request_vote_output sut.replica
-         { term = 1L; replica_id = 1; vote_granted = true }
-       = []);
+let%test_unit "request vote output" =
+  (* Given a replica that started term 2 and an election. *)
+  with_test_cluster @@ fun cluster ->
+  let sut = List.hd cluster.replicas in
 
-     (* Receives a message from a replica that didn't grant the vote. *)
-     assert (
-       handle_request_vote_output sut.replica
-         { term = 2L; replica_id = 2; vote_granted = false }
-       = []);
+  sut.replica.persistent_state.current_term <- 2L;
 
-     (* Receives a message from a replica that did grant the vote.
-        Candidate voted for itself and received vote from other replica. Should become leader.
-     *)
-     let message =
-       {
-         leader_term = sut.replica.persistent_state.current_term;
-         leader_id = sut.replica.config.id;
-         replica_id = 0;
-         previous_log_index = sut.replica.storage.last_log_index ();
-         previous_log_term = sut.replica.storage.last_log_term ();
-         leader_commit = sut.replica.volatile_state.commit_index;
-         entries = [];
-       }
-     in
-     assert (
-       handle_request_vote_output sut.replica
-         { term = 2L; replica_id = 30; vote_granted = true }
-       = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
-     assert (sut.replica.volatile_state.state = Leader) *)
+  (* Candidate voted for itself. *)
+  sut.replica.volatile_state.election.votes_received <-
+    ReplicaIdSet.add sut.replica.config.id ReplicaIdSet.empty;
+
+  (* Replica is not in the Candidate state. Ignores messages when not in the candidate state. *)
+  assert (sut.replica.volatile_state.state <> Candidate);
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 2L; replica_id = 2; vote_granted = true }
+    = []);
+
+  (* Transition to Candidate state. *)
+  sut.replica.volatile_state.state <- Candidate;
+
+  (* Should ignore messages that don't contain the current term. *)
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 1L; replica_id = 1; vote_granted = true }
+    = []);
+
+  (* Receives a message from a replica that didn't grant the vote. *)
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 2L; replica_id = 2; vote_granted = false }
+    = []);
+
+  (* Receives a message from a replica that did grant the vote.
+     Candidate voted for itself and received vote from other replica. Should become leader.
+  *)
+  let message =
+    {
+      leader_term = sut.replica.persistent_state.current_term;
+      leader_id = sut.replica.config.id;
+      replica_id = 0;
+      previous_log_index = sut.replica.storage.last_log_index ();
+      previous_log_term = sut.replica.storage.last_log_term ();
+      leader_commit = sut.replica.volatile_state.commit_index;
+      entries = [];
+    }
+  in
+  assert (
+    handle_request_vote_output sut.replica
+      { term = 2L; replica_id = 30; vote_granted = true }
+    = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
+  assert (sut.replica.volatile_state.state = Leader)
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
   with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
@@ -1082,7 +1110,36 @@ let%test_unit "append entries: message term > replica term, update own term \
     sut.replica.storage.initial_state ()
     = { current_term = 1L; voted_for = None })
 
-(*let%test_unit "start_election: starts new term / transitions to candidate \
+let%test_unit "append entries: resets election timeout when request succeeds" =
+  (* Given a replica in the Candidate state *)
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  let timeout = sut.replica.volatile_state.next_election_timeout in
+
+  (* Replica receives an AppendEntries request from the leader. *)
+  assert (
+    handle_append_entries sut.replica
+      {
+        leader_term = 1L;
+        leader_id = 1;
+        replica_id = 0;
+        previous_log_index = 0L;
+        previous_log_term = 0L;
+        entries = [ { term = 1L; data = "1" } ];
+        leader_commit = 0L;
+      }
+    = {
+        term = 1L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = sut.replica.config.id;
+      });
+
+  (* Replica should reset the election timeout. *)
+  assert (
+    Int64.add 1L timeout.version
+    = sut.replica.volatile_state.next_election_timeout.version)
+
+let%test_unit "start_election: starts new term / transitions to candidate \
                /resets voted_for / returns a list of request vote message that \
                should be sent to other replicas" =
   with_test_cluster @@ fun cluster ->
@@ -1101,37 +1158,52 @@ let%test_unit "append entries: message term > replica term, update own term \
     start_election sut.replica
     = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
   assert (sut.replica.persistent_state = { current_term = 1L; voted_for = None });
-  assert (sut.replica.volatile_state.state = Candidate)*)
+  assert (sut.replica.volatile_state.state = Candidate)
 
+(* Calls a function to assert something until the assertion succeeds or the time expires. *)
 let assert_eventually ~clock ~(wait_for_ms : int) (condition : unit -> unit) :
     unit =
-  let started = Eio.Time.now clock in
+  let wait_for =
+    (* Convert from ms to ns. *)
+    Mtime.Span.of_uint64_ns (Int64.of_int (wait_for_ms * 1000000))
+  in
+
+  let started = Eio.Time.Mono.now clock in
 
   let rec go () =
     try condition ()
     with Assert_failure exn ->
-      let elapsed = Eio.Time.now clock -. started in
+      let elapsed =
+        Mtime.Span.abs_diff
+          (Mtime.Span.of_uint64_ns
+             (Mtime.to_uint64_ns (Eio.Time.Mono.now clock)))
+          (Mtime.Span.of_uint64_ns (Mtime.to_uint64_ns started))
+      in
 
-      (* Divide by 1000 to convert from ms to seconds. *)
-      if elapsed > float_of_int (wait_for_ms / 1000) then
-        raise (Assert_failure exn)
+      if Mtime.Span.compare elapsed wait_for = 1 then raise (Assert_failure exn)
       else (
         (* Wait for a little while before checking the condition again. *)
-        Eio.Time.sleep clock 0.10;
+        Eio.Time.Mono.sleep clock 0.10;
         go ())
   in
   go ()
 
 let%test_unit "handle_message: election timeout fired" =
-  print_endline "    ---- here ----";
   (* Given a cluster with no leader and replicas at term 0. *)
   with_test_cluster @@ fun cluster ->
   let sut = List.hd cluster.replicas in
 
+  let timeout = sut.replica.volatile_state.next_election_timeout in
+
   (* A replica's election timeout fires and it sends request vote requests. *)
   handle_message sut.replica
-    (ElectionTimeoutFired { at = Mtime_clock.now (); version = 1L });
+    (ElectionTimeoutFired { at = Mtime_clock.now (); version = timeout.version });
+
+  (* Replica starts an election and resets the election timeout. *)
+  assert (
+    Int64.add 1L timeout.version
+    = sut.replica.volatile_state.next_election_timeout.version);
 
   (* The replica becomes leader. *)
   assert_eventually ~clock:sut.clock ~wait_for_ms:300 (fun () ->
-      sut.replica.volatile_state.state = Leader)
+      assert (sut.replica.volatile_state.state = Leader))

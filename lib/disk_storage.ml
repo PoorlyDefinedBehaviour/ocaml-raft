@@ -11,6 +11,22 @@ type t = {
   mutable last_log_term : Protocol.term;
   (* The index of the last log entry. *)
   mutable last_log_index : int64;
+  (* The index of the first log entry that had the highest term seen.
+     Example:
+     Given a log with the entries:
+        {index=1; term=1}
+        {index=2; term=2}
+
+        The index would be 2.
+
+        If we append one more entry, the index would be 3
+        because the entry term is greater than the greatest term
+        {index=3; term=3}
+
+        If we append another entry, the index is still 3 because the term is not greater.
+       {index=4; term=3}
+  *)
+  mutable first_log_index_with_latest_term : int64;
 }
 
 type config = { (* Directory used to store Raft files *)
@@ -62,9 +78,10 @@ let create (config : config) : t =
       Out_channel.open_gen
         [ Out_channel.Open_creat; Out_channel.Open_append ]
         0o777 log_file_path;
-    (* TODO: call last_log_entry *)
+    (* TODO: get last_log_entry *)
     last_log_term = 0L;
     last_log_index = 0L;
+    first_log_index_with_latest_term = 0L;
   }
 
 let initial_state (storage : t) : Protocol.initial_state =
@@ -112,6 +129,9 @@ let header_of_bytes (buffer : bytes) : header =
 
 let last_log_term (storage : t) : Protocol.term = storage.last_log_term
 let last_log_index (storage : t) : int64 = storage.last_log_index
+
+let first_log_index_with_latest_term (storage : t) : int64 =
+  storage.first_log_index_with_latest_term
 
 (* Reads an entry from [in_chan] *)
 let read_entry (in_chan : in_channel) : Protocol.entry option =
@@ -234,7 +254,10 @@ let append_entries (storage : t) (previous_log_index : int64)
 
       match entry_at_index storage entry_index with
       (* New entry, append to the log. *)
-      | None -> write_entry storage.log_file_out entry
+      | None ->
+          write_entry storage.log_file_out entry;
+          if entry.term > storage.last_log_term then
+            storage.first_log_index_with_latest_term <- entry_index
       | Some existing_entry ->
           (* New entry conflicts with existing entry, truncate the log and append the new entry. *)
           if existing_entry.term <> entry.term then (
@@ -267,6 +290,21 @@ let persist (storage : t) (state : Protocol.persistent_state) : unit =
   seek_out storage.state_file_out 0;
   Out_channel.output_string storage.state_file_out contents;
   Out_channel.flush storage.state_file_out
+
+let%test_unit "append entries: updates first log index with latest term" =
+  let storage = create { dir = Test_util.temp_dir () } in
+
+  append_entries storage (last_log_index storage)
+    [ { term = 1L; data = "1" }; { term = 2L; data = "2" } ];
+  assert (storage.first_log_index_with_latest_term = 2L);
+
+  append_entries storage (last_log_index storage) [ { term = 3L; data = "3" } ];
+
+  assert (storage.first_log_index_with_latest_term = 3L);
+
+  append_entries storage (last_log_index storage) [ { term = 3L; data = "4" } ];
+
+  assert (storage.first_log_index_with_latest_term = 3L)
 
 let%test_unit "append entries: updates last log term and last log index" =
   let storage = create { dir = Test_util.temp_dir () } in

@@ -7,6 +7,7 @@ val create : config -> t
 val initial_state : t -> Protocol.initial_state
 val last_log_term : t -> Protocol.term
 val last_log_index : t -> int64
+val first_log_index_with_latest_term:  t -> int64 
 val persist : t -> Protocol.persistent_state -> unit
 val entry_at_index:t -> int64 -> Protocol.entry option
 val truncate : t -> int64 -> unit

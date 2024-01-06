@@ -171,6 +171,21 @@ let entry_at_index (storage : t) (index : int64) : Protocol.entry option =
     (* Read the entry at the offset. *)
     read_entry (Unix.in_channel_of_descr storage.log_file_in)
 
+(* TODO: test *)
+let get_entry_batch (storage : t) ~(from_index : int64) ~(max_size_bytes : int)
+    : Protocol.entry list =
+  let rec go i size entries =
+    match entry_at_index storage i with
+    | None -> entries
+    | Some entry ->
+        let entry_size_bytes = 8 (*term size*) + String.length entry.data in
+        let new_size = size + entry_size_bytes in
+        if new_size >= max_size_bytes then entries
+        else go (Int64.add 1L i) new_size (entry :: entries)
+  in
+
+  go from_index 0 []
+
 (* Writes [entry] to [out_chan]. Does not flush [out_chan]. *)
 let write_entry (out_chan : out_channel) (entry : Protocol.entry) : unit =
   let header =

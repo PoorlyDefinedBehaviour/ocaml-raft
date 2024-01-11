@@ -67,8 +67,6 @@ type volatile_state = {
   mutable election : election;
   (* When the next election timeout will fire. *)
   mutable next_election_timeout : timeout;
-  (* When the next heartbeat timeout will fire. *)
-  mutable next_heartbeat_timeout : timeout;
   (* For each server, the index of the last log entry to send to that server (initialized to Leader last log index + 1) *)
   mutable next_index : (Protocol.replica_id, int64) Hashtbl.t; [@opaque]
   (* For each server, the index of the last log entry known to be replicated on the server (initialized to 0, increases monotonically) *)
@@ -82,6 +80,8 @@ type config = {
   id : replica_id;
   (* The ids of the replicas in the cluster. Must include the replica id. *)
   cluster_members : replica_id list;
+  (* How long to wait for between sending append entries requests. *)
+  heartbeat_interval : int;
   (* The range used to decide the election timeout. Min must be < max.*)
   election_timeout : range;
   (* The size of the batch that can be sent in each append entries request.
@@ -112,7 +112,7 @@ type replica = {
 
 type input_message =
   (* The heartbeat timeout has fired. *)
-  | HeartbeatTimeoutFired of timeout
+  | HeartbeatTimeoutFired
   (* The election timeout has fired. *)
   | ElectionTimeoutFired of timeout
   (* Received a request vote request. *)
@@ -130,7 +130,7 @@ let term_of_input_message (message : input_message) : Protocol.term =
   match message with
   | RequestVote message -> message.term
   | AppendEntries message -> message.leader_term
-  | HeartbeatTimeoutFired _ -> invalid_arg "HeartbeatTimeoutFired"
+  | HeartbeatTimeoutFired -> invalid_arg "HeartbeatTimeoutFired"
   | ElectionTimeoutFired _ -> invalid_arg "ElectionTimeoutFired"
   | AppendEntriesOutput _ -> invalid_arg "AppendEntriesOutput"
   | RequestVoteOutput _ -> invalid_arg "RequestVoteOutput"
@@ -141,7 +141,7 @@ let replica_id_of_input_message (message : input_message) : Protocol.replica_id
   match message with
   | RequestVote message -> message.candidate_id
   | AppendEntries message -> message.leader_id
-  | HeartbeatTimeoutFired _ -> invalid_arg "HeartbeatTimeoutFired"
+  | HeartbeatTimeoutFired -> invalid_arg "HeartbeatTimeoutFired"
   | ElectionTimeoutFired _ -> invalid_arg "ElectionTimeoutFired"
   | AppendEntriesOutput _ -> invalid_arg "AppendEntriesOutput"
   | RequestVoteOutput _ -> invalid_arg "RequestVoteOutput"
@@ -175,53 +175,6 @@ let create_next_index_map ~(replica_id : Protocol.replica_id)
         Hashtbl.replace hash_table id (Int64.add 1L last_log_index))
     cluster_members;
   hash_table
-
-(* Handles a request vote output message.
-   Becomes leader and returns heartbeat messages if it received votes from a quorum. *)
-let handle_request_vote_output (replica : replica)
-    (message : request_vote_output) : append_entries_input list =
-  (* Ignore messages that are responses to older request vote requests. *)
-  if
-    replica.volatile_state.state <> Candidate
-    || message.term <> replica.persistent_state.current_term
-  then []
-  else (
-    if message.vote_granted then
-      replica.volatile_state.election <-
-        {
-          votes_received =
-            ReplicaIdSet.add message.replica_id
-              replica.volatile_state.election.votes_received;
-        };
-
-    (* If replica received votes from a quorum. *)
-    if
-      ReplicaIdSet.cardinal replica.volatile_state.election.votes_received
-      >= majority (List.length replica.config.cluster_members)
-    then (
-      (* Transition to leader. *)
-      replica.volatile_state.state <- Leader;
-
-      (* TODO: commit empty log entry? *)
-
-      (* Return heartbeat messages. *)
-      List.filter_map
-        (fun replica_id ->
-          if replica_id <> replica.config.id then
-            Some
-              {
-                leader_term = replica.persistent_state.current_term;
-                leader_id = replica.config.id;
-                replica_id;
-                (* TODO: are previous_log_index and previous_log_term correct here? *)
-                previous_log_index = replica.storage.last_log_index ();
-                previous_log_term = replica.storage.last_log_term ();
-                leader_commit = replica.volatile_state.commit_index;
-                entries = [];
-              }
-          else None)
-        replica.config.cluster_members)
-    else [])
 
 (* TODO: is the leader comitting? *)
 (* Applies unapplied entries to the state machine. *)
@@ -303,29 +256,15 @@ let handle_append_entries_output (replica : replica)
         because the entries are in 2 out of 3 servers. *)
     let n = ref 1 in
 
-    List.iter
-      (fun (index, count) ->
-        Printf.printf
-          "log entries up to index %Ld are replicated on %d servers\n" index
-          count)
-      match_index;
-
     let exception Break in
     (try
        let quorum = majority (List.length replica.config.cluster_members) in
        List.iter
          (fun (index, count) ->
-           Printf.printf
-             "low_watermark=%Ld commit_index=%Ld index=%Ld count=%d \
-              message.last_log_index=%Ld\n"
-             low_watermark replica.volatile_state.commit_index index count
-             message.last_log_index;
            if index >= low_watermark then (
              n := !n + count;
-             Printf.printf "n=%d\n" !n;
 
              if !n >= quorum then (
-               Printf.printf "committing index %Ld\n" index;
                replica.volatile_state.commit_index <- index;
                commit replica;
                raise Break)))
@@ -368,7 +307,8 @@ let prepare_append_entries (replica : replica)
   let next_index = Hashtbl.find replica.volatile_state.next_index replica_id in
   let previous_index = Int64.sub 1L next_index in
   let previous_entry =
-    replica.storage.entry_at_index previous_index |> Option.get
+    if previous_index > 0L then replica.storage.entry_at_index previous_index
+    else None
   in
   let entries =
     replica.storage.get_entry_batch ~from_index:next_index
@@ -380,10 +320,22 @@ let prepare_append_entries (replica : replica)
     leader_id = replica.config.id;
     replica_id;
     previous_log_index = previous_index;
-    previous_log_term = previous_entry.term;
+    previous_log_term =
+      (match previous_entry with None -> 0L | Some entry -> entry.term);
     entries;
     leader_commit = replica.volatile_state.commit_index;
   }
+
+let handle_heartbeat_timeout_fired (replica : replica) :
+    Protocol.append_entries_input list =
+  if replica.volatile_state.state <> Leader then []
+  else
+    (* TODO: reset heartbeat timeout? *)
+    List.filter_map
+      (fun replica_id ->
+        if replica_id == replica.config.id then None
+        else Some (prepare_append_entries replica ~replica_id))
+      replica.config.cluster_members
 
 let rec handle_request_vote (replica : replica) (message : request_vote_input) :
     request_vote_output =
@@ -417,6 +369,68 @@ let rec handle_request_vote (replica : replica) (message : request_vote_input) :
   replica.storage.persist replica.persistent_state;
   if response.vote_granted then reset_election_timeout replica;
   response
+
+and become_leader (replica : replica) : unit =
+  replica.volatile_state.state <- Leader;
+
+  (* Spawning a fiber for each timeout is not necessary but I don't wanna spend more time on this project. *)
+  Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
+      (* Sleep until until the moment the timeout should fire. *)
+      Eio.Time.Mono.sleep replica.clock
+        (* Divide by 1000 to convert from ms to seconds. *)
+        (float_of_int replica.config.heartbeat_interval /. 1000.0);
+
+      (* Let the replica that the timeout has fired. *)
+      handle_message replica HeartbeatTimeoutFired;
+
+      `Stop_daemon)
+
+(* Handles a request vote output message.
+   Becomes leader and returns heartbeat messages if it received votes from a quorum. *)
+and handle_request_vote_output (replica : replica)
+    (message : request_vote_output) : append_entries_input list =
+  (* Ignore messages that are responses to older request vote requests. *)
+  if
+    replica.volatile_state.state <> Candidate
+    || message.term <> replica.persistent_state.current_term
+  then []
+  else (
+    if message.vote_granted then
+      replica.volatile_state.election <-
+        {
+          votes_received =
+            ReplicaIdSet.add message.replica_id
+              replica.volatile_state.election.votes_received;
+        };
+
+    (* If replica received votes from a quorum. *)
+    if
+      ReplicaIdSet.cardinal replica.volatile_state.election.votes_received
+      >= majority (List.length replica.config.cluster_members)
+    then (
+      (* Transition to leader. *)
+      become_leader replica;
+
+      (* TODO: commit empty log entry? *)
+
+      (* Return heartbeat messages. *)
+      List.filter_map
+        (fun replica_id ->
+          if replica_id <> replica.config.id then
+            Some
+              {
+                leader_term = replica.persistent_state.current_term;
+                leader_id = replica.config.id;
+                replica_id;
+                (* TODO: are previous_log_index and previous_log_term correct here? *)
+                previous_log_index = replica.storage.last_log_index ();
+                previous_log_term = replica.storage.last_log_term ();
+                leader_commit = replica.volatile_state.commit_index;
+                entries = [];
+              }
+          else None)
+        replica.config.cluster_members)
+    else [])
 
 and handle_append_entries (replica : replica) (message : append_entries_input) :
     append_entries_output =
@@ -517,17 +531,12 @@ and reset_election_timeout (replica : replica) : unit =
 and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
       match input_message with
-      | HeartbeatTimeoutFired timeout ->
-          if
-            timeout.version
-            = replica.volatile_state.next_heartbeat_timeout.version
-          then
-            List.iter
-              (fun replica_id ->
-                if replica_id <> replica.config.id then
-                  replica.transport.send_append_entries_input replica_id
-                    (prepare_append_entries replica ~replica_id))
-              replica.config.cluster_members
+      | HeartbeatTimeoutFired ->
+          List.iter
+            (fun (message : Protocol.append_entries_input) ->
+              replica.transport.send_append_entries_input message.replica_id
+                message)
+            (handle_heartbeat_timeout_fired replica)
       | ElectionTimeoutFired timeout ->
           (* The timeout version will not be current timeout version
              when the election timeout has been reset. *)
@@ -587,7 +596,6 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
           last_applied_index = 0L;
           election = { votes_received = ReplicaIdSet.empty };
           next_election_timeout = { at = Mtime_clock.now (); version = 0L };
-          next_heartbeat_timeout = { at = Mtime_clock.now (); version = 0L };
           next_index =
             create_next_index_map ~replica_id:config.id
               ~cluster_members:config.cluster_members
@@ -668,6 +676,7 @@ let test_replica ~(sw : Eio.Switch.t) ~clock
           cluster_members = [];
           election_timeout = { min = 150; max = 300 };
           append_entries_max_batch_size_in_bytes = 64000;
+          heartbeat_interval = 75;
         }
     | Some v -> v
   in
@@ -714,6 +723,7 @@ let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
       cluster_members = replica_ids;
       election_timeout = { min = 150; max = 300 };
       append_entries_max_batch_size_in_bytes = 64000;
+      heartbeat_interval = 75;
     }
   in
 
@@ -1041,8 +1051,44 @@ let%test_unit "prepare_append_entries: returns the append entry message that \
                should be sent to a specific replica" =
   with_test_replica { current_term = 2L; voted_for = None } @@ fun sut ->
   sut.replica.volatile_state.state <- Leader;
-
+  (* TODO *)
   ()
+
+let%test_unit "handle_heartbeat_timeout_fired: when not in the leader state, \
+               returns the empty list because no message should be sent" =
+  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
+  assert (handle_heartbeat_timeout_fired sut.replica = [])
+
+let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
+               returns the append entries requests that should be sent to \
+               other replicas" =
+  with_test_cluster @@ fun cluster ->
+  let sut = List.hd cluster.replicas in
+  print_endline "       -xxxxxx--";
+  sut.replica.volatile_state.state <- Leader;
+  (* Pretend the heartbeat timeout fired. *)
+  assert (
+    handle_heartbeat_timeout_fired sut.replica
+    = [
+        {
+          leader_term = sut.replica.persistent_state.current_term;
+          leader_id = sut.replica.config.id;
+          replica_id = (List.nth cluster.replicas 1).replica.config.id;
+          previous_log_index = 0L;
+          previous_log_term = 0L;
+          entries = [];
+          leader_commit = sut.replica.volatile_state.commit_index;
+        };
+        {
+          leader_term = sut.replica.persistent_state.current_term;
+          leader_id = sut.replica.config.id;
+          replica_id = (List.nth cluster.replicas 2).replica.config.id;
+          previous_log_index = 0L;
+          previous_log_term = 0L;
+          entries = [];
+          leader_commit = sut.replica.volatile_state.commit_index;
+        };
+      ])
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
   with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
@@ -1432,8 +1478,6 @@ let%test_unit "append entries output: leader commits entries that are \
 
   (* Leader should commit up to index 3 because entries are on the leader and on one other replica. *)
   assert (sut.replica.volatile_state.commit_index = 3L);
-
-  Printf.printf "leader commit = %Ld\n" sut.replica.volatile_state.commit_index;
 
   (* Leader has sent entries up to index 5 on this replica. *)
   assert (

@@ -1,4 +1,4 @@
-type replica_id = int [@@deriving show]
+type replica_id = int32 [@@deriving show]
 type term = int64 [@@deriving show]
 
 type persistent_state = {

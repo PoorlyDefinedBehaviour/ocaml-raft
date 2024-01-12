@@ -97,7 +97,7 @@ let initial_state (storage : t) : Protocol.initial_state =
       voted_for =
         (match List.nth pieces 1 with
         | "-1" -> None
-        | replica_id -> Some (int_of_string replica_id));
+        | replica_id -> Some (Int32.of_string replica_id));
     }
   else { current_term = 0L; voted_for = None }
 
@@ -300,7 +300,7 @@ let persist (storage : t) (state : Protocol.persistent_state) : unit =
       (Int64.to_string state.current_term)
       (match state.voted_for with
       | None -> "-1"
-      | Some replica_id -> string_of_int replica_id)
+      | Some replica_id -> Int32.to_string replica_id)
   in
   seek_out storage.state_file_out 0;
   Out_channel.output_string storage.state_file_out contents;
@@ -362,7 +362,7 @@ let%test_unit "persist: stores persistent state on disk" =
   let storage = create { dir = temp_dir } in
 
   let state : Protocol.persistent_state =
-    { current_term = 1L; voted_for = Some 10 }
+    { current_term = 1L; voted_for = Some 10l }
   in
 
   (* Save the state to disk *)
@@ -443,14 +443,14 @@ let%test_unit "initial_state: returns the stored state (there's a file on disk)"
   assert (initial_state storage = { current_term = 0L; voted_for = None });
 
   (* Update the state file. *)
-  persist storage { current_term = 1L; voted_for = Some 1 };
+  persist storage { current_term = 1L; voted_for = Some 1l };
 
   (* Read the file again, initial state should be the one stored. *)
-  assert (initial_state storage = { current_term = 1L; voted_for = Some 1 });
+  assert (initial_state storage = { current_term = 1L; voted_for = Some 1l });
 
   (* Reopen the file just to be sure it doesn't get truncated. *)
   let storage = create { dir } in
-  assert (initial_state storage = { current_term = 1L; voted_for = Some 1 })
+  assert (initial_state storage = { current_term = 1L; voted_for = Some 1l })
 
 let%test_unit "entry_at_index: returns the entry at the index" =
   let dir = Test_util.temp_dir () in

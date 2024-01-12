@@ -1,5 +1,5 @@
 open Protocol
-module ReplicaIdSet = Set.Make (Int)
+module ReplicaIdSet = Set.Make (Int32)
 
 type storage = {
   (* Returns the persistent state stored on disk.
@@ -667,7 +667,7 @@ let test_replica ~(sw : Eio.Switch.t) ~clock
     | Some v -> v
   in
 
-  let id = match replica_id with None -> 0 | Some v -> v in
+  let id = match replica_id with None -> 0l | Some v -> v in
   let config =
     match config with
     | None ->
@@ -715,11 +715,11 @@ type test_cluster = { sw : Eio.Switch.t; replicas : test_replica list }
 let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
   let num_replicas = 3 in
 
-  let replica_ids = List.init num_replicas (fun i -> i) in
+  let replica_ids = List.init num_replicas Int32.of_int in
 
   let config =
     {
-      id = 0;
+      id = 0l;
       cluster_members = replica_ids;
       election_timeout = { min = 150; max = 300 };
       append_entries_max_batch_size_in_bytes = 64000;
@@ -791,16 +791,16 @@ let%test_unit "request vote: replica receives message with higher term -> \
     handle_request_vote sut.replica
       {
         term = 1L;
-        candidate_id = 1;
+        candidate_id = 1l;
         last_log_index = 1L;
         last_log_term = 0L;
-        replica_id = 0;
+        replica_id = 0l;
       }
   in
   assert (
     actual
     = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
-  assert (sut.replica.persistent_state.voted_for = Some 1);
+  assert (sut.replica.persistent_state.voted_for = Some 1l);
   assert (sut.replica.persistent_state.current_term = 1L);
   assert (sut.replica.volatile_state.state = Follower);
 
@@ -811,7 +811,7 @@ let%test_unit "request vote: replica receives message with higher term -> \
   in
   assert (
     sut.replica.storage.initial_state ()
-    = { current_term = 1L; voted_for = Some 1 })
+    = { current_term = 1L; voted_for = Some 1l })
 
 let%test_unit "request vote: candidate term is not up to date -> do not grant \
                vote" =
@@ -820,36 +820,36 @@ let%test_unit "request vote: candidate term is not up to date -> do not grant \
     handle_request_vote sut.replica
       {
         term = 0L;
-        candidate_id = 1;
+        candidate_id = 1l;
         last_log_index = 0L;
         last_log_term = 0L;
-        replica_id = 0;
+        replica_id = 0l;
       }
     = { term = 1L; vote_granted = false; replica_id = sut.replica.config.id })
 
 let%test_unit "request vote: replica voted for someone else -> do not grant \
                vote" =
-  with_test_replica { current_term = 0L; voted_for = Some 10 } @@ fun sut ->
+  with_test_replica { current_term = 0L; voted_for = Some 10l } @@ fun sut ->
   assert (
     handle_request_vote sut.replica
       {
         term = 0L;
-        candidate_id = 1;
+        candidate_id = 1l;
         last_log_index = 0L;
         last_log_term = 0L;
-        replica_id = 0;
+        replica_id = 0l;
       }
     = { term = 0L; vote_granted = false; replica_id = sut.replica.config.id })
 
 let%test_unit "request vote: candidate's last log term is less than replica's \
                last log term -> do not grant vote" =
-  with_test_replica { current_term = 0L; voted_for = Some 10 } @@ fun sut ->
+  with_test_replica { current_term = 0L; voted_for = Some 10l } @@ fun sut ->
   assert (
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -866,10 +866,10 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
     handle_request_vote sut.replica
       {
         term = 2L;
-        candidate_id = 2;
+        candidate_id = 2l;
         last_log_index = 1L;
         last_log_term = 0L;
-        replica_id = 0;
+        replica_id = 0l;
       }
     = { term = 2L; vote_granted = false; replica_id = sut.replica.config.id })
 
@@ -881,8 +881,8 @@ let%test_unit "request vote: same last log term but replica's last log index \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
@@ -900,10 +900,10 @@ let%test_unit "request vote: same last log term but replica's last log index \
     handle_request_vote sut.replica
       {
         term = 2L;
-        candidate_id = 2;
+        candidate_id = 2l;
         last_log_index = 1L;
         last_log_term = 1L;
-        replica_id = 0;
+        replica_id = 0l;
       }
     = { term = 2L; vote_granted = false; replica_id = sut.replica.config.id })
 
@@ -914,10 +914,10 @@ let%test_unit "request vote: replica persists decision to storage" =
     handle_request_vote sut.replica
       {
         term = 1L;
-        candidate_id = 5;
+        candidate_id = 5l;
         last_log_index = 4L;
         last_log_term = 2L;
-        replica_id = 3;
+        replica_id = 3l;
       }
     = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
 
@@ -927,7 +927,7 @@ let%test_unit "request vote: replica persists decision to storage" =
       (sut.replica.storage.initial_state ())
   in
 
-  assert (sut.replica.persistent_state.voted_for = Some 5)
+  assert (sut.replica.persistent_state.voted_for = Some 5l)
 
 let%test_unit "request vote: resets election timeout when vote is granted" =
   with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
@@ -938,10 +938,10 @@ let%test_unit "request vote: resets election timeout when vote is granted" =
     handle_request_vote sut.replica
       {
         term = 0L;
-        candidate_id = 5;
+        candidate_id = 5l;
         last_log_index = 0L;
         last_log_term = 0L;
-        replica_id = 2;
+        replica_id = 2l;
       }
     = { term = 1L; vote_granted = false; replica_id = sut.replica.config.id });
 
@@ -954,10 +954,10 @@ let%test_unit "request vote: resets election timeout when vote is granted" =
     handle_request_vote sut.replica
       {
         term = 2L;
-        candidate_id = 5;
+        candidate_id = 5l;
         last_log_index = 4L;
         last_log_term = 2L;
-        replica_id = 3;
+        replica_id = 3l;
       }
     = { term = 2L; vote_granted = true; replica_id = sut.replica.config.id });
 
@@ -974,10 +974,10 @@ let%test_unit "request vote: grants vote to same candidate if the same message \
     handle_request_vote sut.replica
       {
         term = 1L;
-        candidate_id = 5;
+        candidate_id = 5l;
         last_log_index = 4L;
         last_log_term = 2L;
-        replica_id = 3;
+        replica_id = 3l;
       }
     = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id });
 
@@ -987,10 +987,10 @@ let%test_unit "request vote: grants vote to same candidate if the same message \
     handle_request_vote sut.replica
       {
         term = 1L;
-        candidate_id = 5;
+        candidate_id = 5l;
         last_log_index = 4L;
         last_log_term = 2L;
-        replica_id = 3;
+        replica_id = 3l;
       }
     = { term = 1L; vote_granted = true; replica_id = sut.replica.config.id })
 
@@ -1009,7 +1009,7 @@ let%test_unit "request vote output" =
   assert (sut.replica.volatile_state.state <> Candidate);
   assert (
     handle_request_vote_output sut.replica
-      { term = 2L; replica_id = 2; vote_granted = true }
+      { term = 2L; replica_id = 2l; vote_granted = true }
     = []);
 
   (* Transition to Candidate state. *)
@@ -1018,13 +1018,13 @@ let%test_unit "request vote output" =
   (* Should ignore messages that don't contain the current term. *)
   assert (
     handle_request_vote_output sut.replica
-      { term = 1L; replica_id = 1; vote_granted = true }
+      { term = 1L; replica_id = 1l; vote_granted = true }
     = []);
 
   (* Receives a message from a replica that didn't grant the vote. *)
   assert (
     handle_request_vote_output sut.replica
-      { term = 2L; replica_id = 2; vote_granted = false }
+      { term = 2L; replica_id = 2l; vote_granted = false }
     = []);
 
   (* Receives a message from a replica that did grant the vote.
@@ -1034,7 +1034,7 @@ let%test_unit "request vote output" =
     {
       leader_term = sut.replica.persistent_state.current_term;
       leader_id = sut.replica.config.id;
-      replica_id = 0;
+      replica_id = 0l;
       previous_log_index = sut.replica.storage.last_log_index ();
       previous_log_term = sut.replica.storage.last_log_term ();
       leader_commit = sut.replica.volatile_state.commit_index;
@@ -1043,8 +1043,8 @@ let%test_unit "request vote output" =
   in
   assert (
     handle_request_vote_output sut.replica
-      { term = 2L; replica_id = 30; vote_granted = true }
-    = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
+      { term = 2L; replica_id = 30l; vote_granted = true }
+    = [ { message with replica_id = 1l }; { message with replica_id = 2l } ]);
   assert (sut.replica.volatile_state.state = Leader)
 
 let%test_unit "prepare_append_entries: returns the append entry message that \
@@ -1096,8 +1096,8 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
     handle_append_entries sut.replica
       {
         leader_term = 0L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [];
@@ -1122,8 +1122,8 @@ let%test_unit "append entries: message.previous_log_index > \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 1L;
         previous_log_term = 0L;
         entries = [];
@@ -1147,8 +1147,8 @@ let%test_unit "append entries: truncates log in conflict" =
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries =
@@ -1171,8 +1171,8 @@ let%test_unit "append entries: truncates log in conflict" =
     handle_append_entries sut.replica
       {
         leader_term = 2L;
-        leader_id = 2;
-        replica_id = 0;
+        leader_id = 2l;
+        replica_id = 0l;
         previous_log_index = 2L;
         previous_log_term = 1L;
         entries =
@@ -1199,8 +1199,8 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 1L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "hello world" } ];
@@ -1218,8 +1218,8 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -1237,8 +1237,8 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 1L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "2" } ];
@@ -1260,8 +1260,8 @@ let%test_unit "append entries: leader commit index > replica commit index, \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
@@ -1279,8 +1279,8 @@ let%test_unit "append entries: leader commit index > replica commit index, \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 2L;
         previous_log_term = 1L;
         entries = [ { term = 1L; data = "3" } ];
@@ -1303,8 +1303,8 @@ let%test_unit "append entries: leader commit index > replica commit index, \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 3L;
         previous_log_term = 1L;
         entries = [];
@@ -1326,7 +1326,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
 let%test_unit "append entries: message term > replica term, update own term \
                and transition to follower" =
   (* Given a replica in the Candidate state *)
-  with_test_replica { current_term = 0L; voted_for = Some 5 } @@ fun sut ->
+  with_test_replica { current_term = 0L; voted_for = Some 5l } @@ fun sut ->
   sut.replica.volatile_state.state <- Candidate;
 
   (* Replica receives a message with a term greater than its own *)
@@ -1334,8 +1334,8 @@ let%test_unit "append entries: message term > replica term, update own term \
     handle_append_entries sut.replica
       {
         leader_term = 1L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -1371,8 +1371,8 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
     handle_append_entries sut.replica
       {
         leader_term = 0L;
-        leader_id = 1;
-        replica_id = 0;
+        leader_id = 1l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -1394,8 +1394,8 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
     handle_append_entries sut.replica
       {
         leader_term = 2L;
-        leader_id = 2;
-        replica_id = 0;
+        leader_id = 2l;
+        replica_id = 0l;
         previous_log_index = 0L;
         previous_log_term = 0L;
         entries = [ { term = 1L; data = "1" } ];
@@ -1420,7 +1420,7 @@ let%test_unit "append entries output: message.term <> current term, should \
 
   assert (
     handle_append_entries_output sut.replica
-      { term = 1L; success = true; last_log_index = 1L; replica_id = 2 }
+      { term = 1L; success = true; last_log_index = 1L; replica_id = 2l }
     = `Ignore)
 
 let%test_unit "append entries output: not in the leader state, should ignore \
@@ -1430,7 +1430,7 @@ let%test_unit "append entries output: not in the leader state, should ignore \
 
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = true; last_log_index = 1L; replica_id = 2 }
+      { term = 2L; success = true; last_log_index = 1L; replica_id = 2l }
     = `Ignore)
 
 let%test_unit "append entries output: log inconsistency, should send append \
@@ -1440,7 +1440,7 @@ let%test_unit "append entries output: log inconsistency, should send append \
   sut.replica.volatile_state.state <- Leader;
   sut.replica.persistent_state.current_term <- 2L;
 
-  let replica_id = 2 in
+  let replica_id = 2l in
 
   (* Leader receives an append entries response for a request that did not succeed.
      Should send the append entries request again. *)
@@ -1473,7 +1473,7 @@ let%test_unit "append entries output: leader commits entries that are \
   (* Leader has sent entries up to index 3 on this replica. *)
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = true; last_log_index = 3L; replica_id = 1 }
+      { term = 2L; success = true; last_log_index = 3L; replica_id = 1l }
     = `Ignore);
 
   (* Leader should commit up to index 3 because entries are on the leader and on one other replica. *)
@@ -1482,7 +1482,7 @@ let%test_unit "append entries output: leader commits entries that are \
   (* Leader has sent entries up to index 5 on this replica. *)
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = true; last_log_index = 5L; replica_id = 2 }
+      { term = 2L; success = true; last_log_index = 5L; replica_id = 2l }
     = `Ignore);
 
   (* Leader should commit up to index 5 because entries are on the leader and on one other replica. *)
@@ -1499,13 +1499,13 @@ let%test_unit "start_election: starts new term / transitions to candidate \
       candidate_id = sut.replica.config.id;
       last_log_index = 0L;
       last_log_term = 0L;
-      replica_id = 0;
+      replica_id = 0l;
     }
   in
-  assert (sut.replica.config.id = 0);
+  assert (sut.replica.config.id = 0l);
   assert (
     start_election sut.replica
-    = [ { message with replica_id = 1 }; { message with replica_id = 2 } ]);
+    = [ { message with replica_id = 1l }; { message with replica_id = 2l } ]);
   assert (sut.replica.persistent_state = { current_term = 1L; voted_for = None });
   assert (sut.replica.volatile_state.state = Candidate)
 

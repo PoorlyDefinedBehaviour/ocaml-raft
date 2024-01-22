@@ -59,7 +59,6 @@ let decode_request_vote_input (buffer : string) : Protocol.request_vote_input =
 
   { term; candidate_id; replica_id; last_log_index; last_log_term }
 
-(* TODO: add quickcheck test *)
 let%test_unit "encode - decode request vote input" =
   let message : Protocol.request_vote_input =
     {
@@ -72,6 +71,14 @@ let%test_unit "encode - decode request vote input" =
   in
   assert (
     message |> encode_request_vote_input |> decode_request_vote_input = message)
+
+let%test_unit "quickcheck: encode - decode request vote input" =
+  let test =
+    QCheck.Test.make ~count:1000 ~name:"list_rev_is_involutive"
+      (QCheck.make Protocol.gen_request_vote_input) (fun message ->
+        encode_request_vote_input message |> decode_request_vote_input = message)
+  in
+  QCheck.Test.check_exn test
 
 (* TODO: continue implementing the tcp transport*)
 let encode_request_vote_output message = assert false

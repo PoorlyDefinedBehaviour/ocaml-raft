@@ -1,4 +1,28 @@
 type t = {
+  (* Returns the persistent state stored on disk.
+     Returns if the default initial state if there's no state stored on disk. *)
+  initial_state : unit -> Protocol.initial_state;
+  (* Returns the term of the last log entry. *)
+  last_log_term : unit -> Protocol.term;
+  (* Returns the index of the last log entry. *)
+  last_log_index : unit -> int64;
+  (* Returns the index of the first log entry with the latest term seen. *)
+  first_log_index_with_latest_term : unit -> int64;
+  (* Returns the entry at the index. *)
+  entry_at_index : int64 -> Protocol.entry option;
+  (* Saves the state on persistent storage. *)
+  persist : Protocol.persistent_state -> unit;
+  (* Truncates the log starting from the index. *)
+  truncate : int64 -> unit;
+  (* Appends entries to the log.  *)
+  append_entries : int64 -> Protocol.entry list -> unit;
+  (* Returns the max number of entries where their size in bytes is less than or equal to the max size. *)
+  get_entry_batch :
+    from_index:int64 -> max_size_bytes:int -> Protocol.entry list;
+}
+[@@deriving show]
+
+type storage = {
   (* Used to read from the file that has the persistent state. *)
   state_file_in : in_channel;
   (* Used to write to the file that has the persistent state. *)
@@ -51,40 +75,7 @@ let state_file_name = "state.raft"
 (* The extension given to files that are used to store log entries *)
 let log_file_extension = ".data"
 
-let create (config : config) : t =
-  (*
-     Directories are files on unix.
-     Create the directory where data files will be stored.
-  *)
-  if not (Sys.file_exists config.dir) then
-    Core_unix.mkdir_p ~perm:0o777 config.dir;
-
-  let state_file_pathj = Printf.sprintf "%s/%s" config.dir state_file_name in
-
-  let log_file_path = Printf.sprintf "%s/0%s" config.dir log_file_extension in
-
-  {
-    state_file_in =
-      In_channel.open_gen
-        [ In_channel.Open_creat; In_channel.Open_rdonly ]
-        0o777 state_file_pathj;
-    state_file_out =
-      Out_channel.open_gen
-        [ Out_channel.Open_creat; Out_channel.Open_append ]
-        0o777 state_file_pathj;
-    log_file_in =
-      Unix.openfile log_file_path [ Unix.O_CREAT; Unix.O_RDONLY ] 0o777;
-    log_file_out =
-      Out_channel.open_gen
-        [ Out_channel.Open_creat; Out_channel.Open_append ]
-        0o777 log_file_path;
-    (* TODO: get last_log_entry *)
-    last_log_term = 0L;
-    last_log_index = 0L;
-    first_log_index_with_latest_term = 0L;
-  }
-
-let initial_state (storage : t) : Protocol.initial_state =
+let initial_state (storage : storage) : Protocol.initial_state =
   seek_in storage.state_file_in 0;
 
   let contents = In_channel.input_all storage.state_file_in in
@@ -127,10 +118,10 @@ let header_of_bytes (buffer : bytes) : header =
   assert (header_checksum = Optint.to_int32 (checksum_of_header header));
   header
 
-let last_log_term (storage : t) : Protocol.term = storage.last_log_term
-let last_log_index (storage : t) : int64 = storage.last_log_index
+let last_log_term (storage : storage) : Protocol.term = storage.last_log_term
+let last_log_index (storage : storage) : int64 = storage.last_log_index
 
-let first_log_index_with_latest_term (storage : t) : int64 =
+let first_log_index_with_latest_term (storage : storage) : int64 =
   storage.first_log_index_with_latest_term
 
 (* Reads an entry from [in_chan] *)
@@ -153,7 +144,7 @@ let read_entry (in_chan : in_channel) : Protocol.entry option =
       Some { term = header.term; data }
 
 (* Returns the entry at [index]. *)
-let entry_at_index (storage : t) (index : int64) : Protocol.entry option =
+let entry_at_index (storage : storage) (index : int64) : Protocol.entry option =
   assert (index > 0L);
 
   if index > storage.last_log_index then None
@@ -172,8 +163,8 @@ let entry_at_index (storage : t) (index : int64) : Protocol.entry option =
     read_entry (Unix.in_channel_of_descr storage.log_file_in)
 
 (* TODO: test *)
-let get_entry_batch (storage : t) ~(from_index : int64) ~(max_size_bytes : int)
-    : Protocol.entry list =
+let get_entry_batch (storage : storage) ~(from_index : int64)
+    ~(max_size_bytes : int) : Protocol.entry list =
   let rec go i size entries =
     match entry_at_index storage i with
     | None -> entries
@@ -235,7 +226,7 @@ let last_log_entry (file : in_channel) : Protocol.entry option =
   iter file ~f:(fun entry -> last_entry := Some entry);
   !last_entry
 
-let truncate (storage : t) (index : int64) : unit =
+let truncate (storage : storage) (index : int64) : unit =
   let entry_ends_at = Int64.mul index page_size_in_bytes in
 
   let file_descr = Unix.descr_of_out_channel storage.log_file_out in
@@ -253,7 +244,7 @@ let truncate (storage : t) (index : int64) : unit =
 
 (* TODO: store entries with len > page size in other files and point to them *)
 (* Stores [entries] on disk *)
-let append_entries (storage : t) (previous_log_index : int64)
+let append_entries (storage : storage) (previous_log_index : int64)
     (entries : Protocol.entry list) : unit =
   let new_entries_start_at_offset =
     Int64.mul storage.last_log_index page_size_in_bytes
@@ -294,7 +285,7 @@ let append_entries (storage : t) (previous_log_index : int64)
      storage.last_log_term <- last_entry.term);
   ()
 
-let persist (storage : t) (state : Protocol.persistent_state) : unit =
+let persist (storage : storage) (state : Protocol.persistent_state) : unit =
   let contents =
     Printf.sprintf "%s/%s"
       (Int64.to_string state.current_term)
@@ -306,8 +297,60 @@ let persist (storage : t) (state : Protocol.persistent_state) : unit =
   Out_channel.output_string storage.state_file_out contents;
   Out_channel.flush storage.state_file_out
 
+let make (config : config) : storage =
+  (*
+       Directories are files on unix.
+       Create the directory where data files will be stored.
+    *)
+  if not (Sys.file_exists config.dir) then
+    Core_unix.mkdir_p ~perm:0o777 config.dir;
+
+  let state_file_path = Printf.sprintf "%s/%s" config.dir state_file_name in
+
+  let log_file_path = Printf.sprintf "%s/0%s" config.dir log_file_extension in
+
+  {
+    state_file_in =
+      In_channel.open_gen
+        [ In_channel.Open_creat; In_channel.Open_rdonly ]
+        0o777 state_file_path;
+    state_file_out =
+      Out_channel.open_gen
+        [ Out_channel.Open_creat; Out_channel.Open_append ]
+        0o777 state_file_path;
+    log_file_in =
+      Unix.openfile log_file_path [ Unix.O_CREAT; Unix.O_RDONLY ] 0o777;
+    log_file_out =
+      Out_channel.open_gen
+        [ Out_channel.Open_creat; Out_channel.Open_append ]
+        0o777 log_file_path;
+    (* TODO: get last_log_entry *)
+    last_log_term = 0L;
+    last_log_index = 0L;
+    first_log_index_with_latest_term = 0L;
+  }
+
+let create (config : config) : t =
+  let storage = make config in
+  {
+    initial_state = (fun () -> initial_state storage);
+    last_log_term = (fun () -> last_log_term storage);
+    last_log_index = (fun () -> last_log_index storage);
+    first_log_index_with_latest_term =
+      (fun () -> first_log_index_with_latest_term storage);
+    entry_at_index = (fun index -> entry_at_index storage index);
+    persist = (fun state -> persist storage state);
+    truncate = (fun index -> truncate storage index);
+    append_entries =
+      (fun previous_log_index entries ->
+        append_entries storage previous_log_index entries);
+    get_entry_batch =
+      (fun ~from_index ~max_size_bytes ->
+        get_entry_batch storage ~from_index ~max_size_bytes);
+  }
+
 let%test_unit "append entries: updates first log index with latest term" =
-  let storage = create { dir = Test_util.temp_dir () } in
+  let storage = make { dir = Test_util.temp_dir () } in
 
   append_entries storage (last_log_index storage)
     [ { term = 1L; data = "1" }; { term = 2L; data = "2" } ];
@@ -322,7 +365,7 @@ let%test_unit "append entries: updates first log index with latest term" =
   assert (storage.first_log_index_with_latest_term = 3L)
 
 let%test_unit "append entries: updates last log term and last log index" =
-  let storage = create { dir = Test_util.temp_dir () } in
+  let storage = make { dir = Test_util.temp_dir () } in
 
   append_entries storage 0L [ { term = 2L; data = "1" } ];
 
@@ -336,7 +379,7 @@ let%test_unit "append entries: updates last log term and last log index" =
   assert (2L = last_log_index storage)
 
 let%test_unit "append entries: truncates the log on entry conflict" =
-  let storage = create { dir = Test_util.temp_dir () } in
+  let storage = make { dir = Test_util.temp_dir () } in
 
   (* Leader adds some entries to the replica's log. *)
   append_entries storage (last_log_index storage)
@@ -359,7 +402,7 @@ let%test_unit "append entries: truncates the log on entry conflict" =
 
 let%test_unit "persist: stores persistent state on disk" =
   let temp_dir = Test_util.temp_dir () in
-  let storage = create { dir = temp_dir } in
+  let storage = make { dir = temp_dir } in
 
   let state : Protocol.persistent_state =
     { current_term = 1L; voted_for = Some 10l }
@@ -379,14 +422,14 @@ let%test_unit "persist: stores persistent state on disk" =
   assert (expected = state);
 
   (* Reopen the file and read the same state again *)
-  let storage = create { dir = temp_dir } in
+  let storage = make { dir = temp_dir } in
   let state = initial_state storage in
 
   assert (expected = state)
 
 let%test_unit "last_log_term: returns the term of the last log entry" =
   (* Given an empty log *)
-  let storage = create { dir = Test_util.temp_dir () } in
+  let storage = make { dir = Test_util.temp_dir () } in
 
   (* The last log term is 0 *)
   assert (0L = last_log_term storage);
@@ -404,7 +447,7 @@ let%test_unit "last_log_term: returns the term of the last log entry" =
 
 let%test_unit "last_log_index: returns the index of the last log entry" =
   (* Given an empty log *)
-  let storage = create { dir = Test_util.temp_dir () } in
+  let storage = make { dir = Test_util.temp_dir () } in
 
   (* The last log index is 0 *)
   assert (0L = last_log_index storage);
@@ -423,7 +466,7 @@ let%test_unit "last_log_index: returns the index of the last log entry" =
 
 let%test_unit "initial_state: returns the default initial state on first boot \
                (there's no file on disk)" =
-  let storage = create { dir = Test_util.temp_dir () } in
+  let storage = make { dir = Test_util.temp_dir () } in
 
   let initial_state = initial_state storage in
 
@@ -437,7 +480,7 @@ let%test_unit "initial_state: returns the stored state (there's a file on disk)"
     =
   let dir = Test_util.temp_dir () in
 
-  let storage = create { dir } in
+  let storage = make { dir } in
 
   (* Should return the initial state. *)
   assert (initial_state storage = { current_term = 0L; voted_for = None });
@@ -449,13 +492,13 @@ let%test_unit "initial_state: returns the stored state (there's a file on disk)"
   assert (initial_state storage = { current_term = 1L; voted_for = Some 1l });
 
   (* Reopen the file just to be sure it doesn't get truncated. *)
-  let storage = create { dir } in
+  let storage = make { dir } in
   assert (initial_state storage = { current_term = 1L; voted_for = Some 1l })
 
 let%test_unit "entry_at_index: returns the entry at the index" =
   let dir = Test_util.temp_dir () in
 
-  let storage = create { dir } in
+  let storage = make { dir } in
 
   (* Log is empty *)
   assert (entry_at_index storage 1L = None);
@@ -475,7 +518,7 @@ let%test_unit "entry_at_index: returns the entry at the index" =
   assert (entry_at_index storage 3L = None)
 
 let%test_unit "truncate: truncates the log to index" =
-  let storage = create { dir = Test_util.temp_dir () } in
+  let storage = make { dir = Test_util.temp_dir () } in
 
   (* Log is empty *)
   assert (entry_at_index storage 1L = None);

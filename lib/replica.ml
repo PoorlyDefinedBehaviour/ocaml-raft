@@ -1,43 +1,7 @@
 open Protocol
 module ReplicaIdSet = Set.Make (Int32)
 
-type storage = {
-  (* Returns the persistent state stored on disk.
-     Returns if the default initial state if there's no state stored on disk. *)
-  initial_state : unit -> initial_state;
-  (* Returns the term of the last log entry. *)
-  last_log_term : unit -> term;
-  (* Returns the index of the last log entry. *)
-  last_log_index : unit -> int64;
-  (* Returns the index of the first log entry with the latest term seen. *)
-  first_log_index_with_latest_term : unit -> int64;
-  (* Returns the entry at the index. *)
-  entry_at_index : int64 -> entry option;
-  (* Saves the state on persistent storage. *)
-  persist : persistent_state -> unit;
-  (* Truncates the log starting from the index. *)
-  truncate : int64 -> unit;
-  (* Appends entries to the log.  *)
-  append_entries : int64 -> Protocol.entry list -> unit;
-  (* Returns the max number of entries where their size in bytes is less than or equal to the max size. *)
-  get_entry_batch :
-    from_index:int64 -> max_size_bytes:int -> Protocol.entry list;
-}
-[@@deriving show]
-
-type transport = {
-  (* Sends a request vote request to the replica. *)
-  send_request_vote_input : replica_id -> request_vote_input -> unit;
-  (* Sends a request vote response to the replica. *)
-  send_request_vote_output : replica_id -> request_vote_output -> unit;
-  (* Send a append entries request to the replica. *)
-  send_append_entries_input :
-    replica_id -> Protocol.append_entries_input -> unit;
-  (* Sends a append entries response to the replica. *)
-  send_append_entries_output :
-    replica_id -> Protocol.append_entries_output -> unit;
-}
-[@@deriving show]
+let traceln fmt = Eio.Std.traceln ("replica: " ^^ fmt)
 
 type election = {
   (* A set containing the id of the replicas that voted for the candidate. *)
@@ -95,8 +59,8 @@ type replica = {
   config : config;
   persistent_state : persistent_state;
   volatile_state : volatile_state;
-  storage : storage;
-  transport : transport;
+  storage : Disk_storage.t;
+  transport : Tcp_transport.t;
   (* Function called to apply an entry to the state machine. *)
   fsm_apply : Protocol.entry -> unit;
   (* Must be locked before a message is handled. *)
@@ -106,10 +70,12 @@ type replica = {
   (* The Eio clock. *)
   clock : Mtime.t Eio.Time.clock_ty Eio.Resource.t; [@opaque]
   (* A random number generator. *)
-  random : Random.t;
+  random : Rand.t;
 }
 [@@deriving show]
 
+(* Contains messages that can be received from other replicas and
+   messages sent from this replica to itself (without using the network) *)
 type input_message =
   (* The heartbeat timeout has fired. *)
   | HeartbeatTimeoutFired
@@ -530,6 +496,7 @@ and reset_election_timeout (replica : replica) : unit =
 (* TODO: add heartbeat timeout and send heartbeat on timeout *)
 and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
+      traceln "handling message: %s" (show_input_message input_message);
       match input_message with
       | HeartbeatTimeoutFired ->
           List.iter
@@ -575,9 +542,11 @@ and handle_message (replica : replica) (input_message : input_message) =
                 replica.config.cluster_members))
 
 let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
-    ~(transport : transport) ~(storage : storage)
+    ~(transport : Tcp_transport.t) ~(storage : Disk_storage.t)
     ~(initial_state : initial_state) ~(fsm_apply : Protocol.entry -> unit)
-    ~(random : Random.t) : replica =
+    ~(random : Rand.t) : replica =
+  traceln "creating replica. config=%s" (show_config config);
+
   let replica =
     {
       config;
@@ -619,22 +588,9 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
   replica
 
 (* Returns a Disk_storage instance which writes to a temp folder. *)
-let test_disk_storage ~(dir : string) : storage =
+let test_disk_storage ~(dir : string) : Disk_storage.t =
   Printf.printf "Disk_storage dir = %s\n" dir;
-  let disk_storage = Disk_storage.create { dir } in
-  {
-    initial_state = (fun () -> Disk_storage.initial_state disk_storage);
-    last_log_term = (fun () -> Disk_storage.last_log_term disk_storage);
-    last_log_index = (fun () -> Disk_storage.last_log_index disk_storage);
-    entry_at_index =
-      (fun index -> Disk_storage.entry_at_index disk_storage index);
-    persist = Disk_storage.persist disk_storage;
-    truncate = Disk_storage.truncate disk_storage;
-    append_entries = Disk_storage.append_entries disk_storage;
-    first_log_index_with_latest_term =
-      (fun () -> Disk_storage.first_log_index_with_latest_term disk_storage);
-    get_entry_batch = Disk_storage.get_entry_batch disk_storage;
-  }
+  Disk_storage.create { dir }
 
 type test_replica = {
   (* The directory used to store Raft files. *)
@@ -652,9 +608,9 @@ type test_replica = {
 (* Returns a replica that can be used in tests. *)
 let test_replica ~(sw : Eio.Switch.t) ~clock
     ?(replica_id : Protocol.replica_id option) ?(config : config option)
-    ?(dir : string option) ?(transport : transport option)
+    ?(dir : string option) ?(transport : Tcp_transport.t option)
     (initial_state : Protocol.initial_state) : test_replica =
-  let transport =
+  let transport : Tcp_transport.t =
     match transport with
     | None ->
         (* no-op transport. *)
@@ -688,7 +644,7 @@ let test_replica ~(sw : Eio.Switch.t) ~clock
     replica =
       create ~sw ~clock ~config ~transport ~storage ~initial_state
         ~fsm_apply:(fun entry -> Hashtbl.replace kv entry.data entry.data)
-        ~random:(Random.create ());
+        ~random:(Rand.create ());
     kv;
     sw;
     clock;
@@ -729,7 +685,7 @@ let test_cluster ~(sw : Eio.Switch.t) ~clock : test_cluster =
 
   let replica_map = Hashtbl.create num_replicas in
 
-  let transport =
+  let transport : Tcp_transport.t =
     {
       send_request_vote_input =
         (fun replica_id message ->

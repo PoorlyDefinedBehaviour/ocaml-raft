@@ -1,14 +1,32 @@
+let traceln fmt = Eio.Std.traceln ("tcp_transport: " ^^ fmt)
+
 type t = {
-  (* Functions are the same functions as in the transport type. *)
+  (* Sends a request vote request to the replica. *)
   send_request_vote_input :
     Protocol.replica_id -> Protocol.request_vote_input -> unit;
+  (* Sends a request vote response to the replica. *)
   send_request_vote_output :
     Protocol.replica_id -> Protocol.request_vote_output -> unit;
+  (* Send a append entries request to the replica. *)
   send_append_entries_input :
     Protocol.replica_id -> Protocol.append_entries_input -> unit;
+  (* Sends a append entries response to the replica. *)
   send_append_entries_output :
     Protocol.replica_id -> Protocol.append_entries_output -> unit;
 }
+[@@deriving show]
+
+(* A message that can be received from another replica. *)
+type input_message =
+  (* Received a request vote request. *)
+  | RequestVote of Protocol.request_vote_input
+  (* Received a request vote response. *)
+  | RequestVoteOutput of Protocol.request_vote_output
+  (* Received an append entries request. *)
+  | AppendEntries of Protocol.append_entries_input
+  (* Received an append entries response. *)
+  | AppendEntriesOutput of Protocol.append_entries_output
+[@@deriving show]
 
 let message_type_request_vote_input = '1'
 let message_type_request_vote_output = '2'
@@ -16,7 +34,7 @@ let message_type_append_entries_input = '3'
 let message_type_append_entries_output = '4'
 
 type config = {
-  cluster_members : (Protocol.replica_id, Eio.Net.Sockaddr.stream) Hashtbl.t;
+  cluster_members : (Protocol.replica_id * Eio.Net.Sockaddr.stream) list;
 }
 
 type string_reader = { position : int ref; buffer : string }
@@ -230,19 +248,31 @@ let%test_unit "quickcheck: encode - decode append entries output" =
 let find_or_create_connection ~sw ~net ~connections ~cluster_members ~replica_id
     =
   match Hashtbl.find_opt connections replica_id with
-  | None ->
-      let replica_addr = Hashtbl.find cluster_members replica_id in
-      let flow = Eio.Net.connect ~sw net replica_addr in
-      Hashtbl.replace connections replica_id flow;
-      flow
-  | Some flow -> flow
+  | Some flow -> Ok flow
+  | None -> (
+      let _replica_id, replica_addr =
+        List.find (fun (id, _replica_addr) -> id = replica_id) cluster_members
+      in
+      try
+        let flow = Eio.Net.connect ~sw net replica_addr in
+        Hashtbl.replace connections replica_id flow;
+        Ok flow
+      with exn -> Error exn)
 
 let send ~sw ~net ~connections ~cluster_members ~replica_id ~message =
-  let flow =
+  match
     find_or_create_connection ~sw ~net ~connections ~cluster_members ~replica_id
-  in
-  Eio.Buf_write.with_flow flow (fun to_server ->
-      Eio.Buf_write.string to_server message)
+  with
+  | Ok flow ->
+      Eio.Buf_write.with_flow flow (fun to_server ->
+          Eio.Buf_write.string to_server message)
+  | Error exn ->
+      traceln "error trying to create connection with replica %ld err=%s"
+        replica_id (Printexc.to_string exn)
+
+let receive flow : input_message =
+  Eio.Buf_read.with_flow flow (fun t -> assert false);
+  assert false
 
 (* TODO: Continue implementing the transport to send messages to replicas. *)
 let create ~sw ~net ~(config : config) : t =

@@ -303,25 +303,33 @@ let create ~sw ~net ~(config : config) : t =
   {
     send_request_vote_input =
       (fun replica_id message ->
-        traceln "sending request vote to replica %ld" replica_id;
+        traceln "sending RequestVote %s to replica %ld"
+          (Protocol.show_request_vote_input message)
+          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_request_vote_input message));
     send_request_vote_output =
       (fun replica_id message ->
-        traceln "sending request vote output to replica %ld" replica_id;
+        traceln "sending RequestVoteOutput %s to replica %ld"
+          (Protocol.show_request_vote_output message)
+          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_request_vote_output message));
     send_append_entries_input =
       (fun replica_id message ->
-        traceln "sending append entries to replica %ld" replica_id;
+        traceln "sending AppendEntries %s to replica %ld"
+          (Protocol.show_append_entries_input message)
+          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_append_entries_input message));
     send_append_entries_output =
       (fun replica_id message ->
-        traceln "sending append entries output to replica %ld" replica_id;
+        traceln "sending AppendEntriesOutput %s to replica %ld"
+          (Protocol.show_append_entries_output message)
+          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_append_entries_output message));

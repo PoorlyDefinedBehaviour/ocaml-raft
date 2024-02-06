@@ -7,8 +7,7 @@ let handle_client (replica : Replica.replica) flow addr =
   (* TODO: set max size to max the we may need (can the max append entries size in bytes be used here?) *)
   let buf_reader = Eio.Buf_read.of_flow flow ~max_size:1_000_000_000 in
   let rec loop () =
-    traceln "replica %ld is waiting for a message from %a" replica.config.id
-      Eio.Net.Sockaddr.pp addr;
+    traceln "waiting for a message from %a" Eio.Net.Sockaddr.pp addr;
     match Tcp_transport.receive buf_reader with
     | None ->
         traceln "client connection closed. addr=%a" Eio.Net.Sockaddr.pp addr

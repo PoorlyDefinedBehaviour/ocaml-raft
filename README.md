@@ -13,6 +13,7 @@ ID=2 dune exec ocaml_raft
 
 ## TODO
 
+- Check that the replica append one entry to its log when it becomes a leader
 - Use eio in the network and storage layer
 - Persist last applied index to avoid reapplying the whole log
 - Heartbeat timeout handling. Reset timeout

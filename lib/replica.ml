@@ -127,6 +127,8 @@ let has_voted_for_other_candidate (replica : replica)
 
 (* Called when a replica with a higher term is found. *)
 let transition_to_higher_term (replica : replica) (term : term) : unit =
+  traceln "found higher term. current_term=%Ld new_term=%Ld"
+    replica.persistent_state.current_term term;
   replica.persistent_state.current_term <- term;
   replica.volatile_state.state <- Follower;
   replica.persistent_state.voted_for <- None
@@ -290,17 +292,6 @@ let prepare_append_entries (replica : replica)
     leader_commit = replica.volatile_state.commit_index;
   }
 
-let handle_heartbeat_timeout_fired (replica : replica) :
-    Protocol.append_entries_input list =
-  if replica.volatile_state.state <> Leader then []
-  else
-    (* TODO: reset heartbeat timeout? *)
-    List.filter_map
-      (fun replica_id ->
-        if replica_id = replica.config.id then None
-        else Some (prepare_append_entries replica ~replica_id))
-      replica.config.cluster_members
-
 let rec handle_request_vote (replica : replica) (message : request_vote_input) :
     request_vote_output =
   if message.term > replica.persistent_state.current_term then
@@ -324,6 +315,7 @@ let rec handle_request_vote (replica : replica) (message : request_vote_input) :
     else (
       replica.persistent_state.current_term <- message.term;
       replica.persistent_state.voted_for <- Some message.candidate_id;
+
       {
         term = replica.persistent_state.current_term;
         vote_granted = true;
@@ -332,22 +324,15 @@ let rec handle_request_vote (replica : replica) (message : request_vote_input) :
   in
   replica.storage.persist replica.persistent_state;
   if response.vote_granted then reset_election_timeout replica;
+  traceln "handle_request_vote. message=%s response=%s"
+    (Protocol.show_request_vote_input message)
+    (Protocol.show_request_vote_output response);
   response
 
 and become_leader (replica : replica) : unit =
+  traceln "transitioning to leader";
   replica.volatile_state.state <- Leader;
-
-  (* Spawning a fiber for each timeout is not necessary but I don't wanna spend more time on this project. *)
-  Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
-      (* Sleep until until the moment the timeout should fire. *)
-      Eio.Time.Mono.sleep replica.clock
-        (* Divide by 1000 to convert from ms to seconds. *)
-        (float_of_int replica.config.heartbeat_interval /. 1000.0);
-
-      (* Let the replica that the timeout has fired. *)
-      handle_message replica HeartbeatTimeoutFired;
-
-      `Stop_daemon)
+  spawn_heartbeat_timeout_fiber replica
 
 (* Handles a request vote output message.
    Becomes leader and returns heartbeat messages if it received votes from a quorum. *)
@@ -399,9 +384,7 @@ and handle_request_vote_output (replica : replica)
 and handle_append_entries (replica : replica) (message : append_entries_input) :
     append_entries_output =
   if message.leader_term > replica.persistent_state.current_term then (
-    replica.persistent_state.current_term <- message.leader_term;
-    replica.persistent_state.voted_for <- None;
-    replica.volatile_state.state <- Follower;
+    transition_to_higher_term replica message.leader_term;
     replica.storage.persist replica.persistent_state);
 
   if
@@ -446,6 +429,31 @@ and handle_append_entries (replica : replica) (message : append_entries_input) :
       replica_id = replica.config.id;
     })
 
+and spawn_heartbeat_timeout_fiber (replica : replica) : unit =
+  (* Spawning a fiber for each timeout is not necessary but I don't wanna spend more time on this project. *)
+  Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
+      (* Sleep until until the moment the timeout should fire. *)
+      Eio.Time.Mono.sleep replica.clock
+        (* Divide by 1000 to convert from ms to seconds. *)
+        (float_of_int replica.config.heartbeat_interval /. 1000.0);
+
+      (* Let the replica that the timeout has fired. *)
+      handle_message replica HeartbeatTimeoutFired;
+
+      `Stop_daemon)
+
+and handle_heartbeat_timeout_fired (replica : replica) :
+    Protocol.append_entries_input list =
+  if replica.volatile_state.state <> Leader then []
+  else (
+    spawn_heartbeat_timeout_fiber replica;
+    (* TODO: reset heartbeat timeout? *)
+    List.filter_map
+      (fun replica_id ->
+        if replica_id = replica.config.id then None
+        else Some (prepare_append_entries replica ~replica_id))
+      replica.config.cluster_members)
+
 and start_election (replica : replica) : request_vote_input list =
   (* Start a new term. *)
   replica.persistent_state.current_term <-
@@ -455,6 +463,9 @@ and start_election (replica : replica) : request_vote_input list =
   replica.volatile_state.state <- Candidate;
 
   reset_election_timeout replica;
+
+  traceln "starting election. new term is %Ld"
+    replica.persistent_state.current_term;
 
   (* votes_received starts with the candidate because it votes for itself. *)
   replica.volatile_state.election <-
@@ -477,6 +488,7 @@ and start_election (replica : replica) : request_vote_input list =
 
 and reset_election_timeout (replica : replica) : unit =
   let timeout = random_election_timeout replica in
+  traceln "next election timeout at: %a" Mtime.pp timeout.at;
 
   replica.volatile_state.next_election_timeout <- timeout;
 
@@ -494,7 +506,9 @@ and reset_election_timeout (replica : replica) : unit =
 (* TODO: add heartbeat timeout and send heartbeat on timeout *)
 and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
-      traceln "handling message: %s" (show_input_message input_message);
+      traceln "handling message: current_term=%Ld %s"
+        replica.persistent_state.current_term
+        (show_input_message input_message);
       match input_message with
       | HeartbeatTimeoutFired ->
           List.iter
@@ -543,7 +557,8 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : Tcp_transport.t) ~(storage : Disk_storage.t)
     ~(initial_state : initial_state) ~(fsm_apply : Protocol.entry -> unit)
     ~(random : Rand.t) : replica =
-  traceln "creating replica. config=%s" (show_config config);
+  traceln "creating replica. config=%s initial_state=%s" (show_config config)
+    (show_initial_state initial_state);
 
   let replica =
     {
@@ -1018,7 +1033,7 @@ let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
                other replicas" =
   with_test_cluster @@ fun cluster ->
   let sut = List.hd cluster.replicas in
-  print_endline "       -xxxxxx--";
+
   sut.replica.volatile_state.state <- Leader;
   (* Pretend the heartbeat timeout fired. *)
   assert (
@@ -1510,3 +1525,8 @@ let%test_unit "handle_message: election timeout fired" =
   (* The replica becomes leader. *)
   assert_eventually ~clock:sut.clock ~wait_for_ms:300 (fun () ->
       assert (sut.replica.volatile_state.state = Leader))
+
+let%test_unit "random_election_timeout: returns a random timeout that's in the \
+               timeout range" =
+  (* TODO *)
+  assert false

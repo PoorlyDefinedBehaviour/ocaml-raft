@@ -40,8 +40,8 @@ let main ~net ~clock =
         {
           id = replica_id;
           cluster_members;
-          heartbeat_interval = 50;
-          election_timeout = { min = 150; max = 250 };
+          heartbeat_interval = 500;
+          election_timeout = { min = 1500; max = 2500 };
           append_entries_max_batch_size_in_bytes = 4096;
         }
       in

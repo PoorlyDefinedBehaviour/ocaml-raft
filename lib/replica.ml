@@ -166,7 +166,6 @@ let commit (replica : replica) : unit =
   | Break -> ()
   | exn -> raise exn
 
-(* TODO: test *)
 (* Handles a response to an append entries message. *)
 let handle_append_entries_output (replica : replica)
     (message : Protocol.append_entries_output) =

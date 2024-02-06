@@ -37,13 +37,8 @@ type config = {
   cluster_members : (Protocol.replica_id * Eio.Net.Sockaddr.stream) list;
 }
 
-type string_reader = { position : int ref; buffer : string }
-
-let create_string_reader (buffer : string) = { position = ref 0; buffer }
-
-let read_bool (reader : string_reader) : bool =
-  let value = String.get reader.buffer !(reader.position) in
-  reader.position := !(reader.position) + 1;
+let read_bool (reader : Eio.Buf_read.t) : bool =
+  let value = Eio.Buf_read.any_char reader in
   match value with
   | 't' -> true
   | 'f' -> false
@@ -53,27 +48,18 @@ let read_bool (reader : string_reader) : bool =
            (Printf.sprintf
               "read_bool: expected a char representing a boolean but got: %c" c))
 
-let read_char (reader : string_reader) =
-  let value = String.get reader.buffer !(reader.position) in
-  reader.position := !(reader.position) + 1;
-  value
+let read_char (reader : Eio.Buf_read.t) = Eio.Buf_read.any_char reader
 
-let read_int64_be (reader : string_reader) =
-  let value = String.get_int64_be reader.buffer !(reader.position) in
-  reader.position := !(reader.position) + 8;
-  value
+let read_int64_be (reader : Eio.Buf_read.t) =
+  let buffer = Eio.Buf_read.take 8 reader in
+  String.get_int64_be buffer 0
 
-let read_int32_be (reader : string_reader) =
-  let value = String.get_int32_be reader.buffer !(reader.position) in
-  reader.position := !(reader.position) + 4;
-  value
+let read_int32_be (reader : Eio.Buf_read.t) =
+  let buffer = Eio.Buf_read.take 4 reader in
+  String.get_int32_be buffer 0
 
-let read_string_of_len (reader : string_reader) (len : int64) : string =
-  let data_len = Int64.to_int len in
-  let buffer = Bytes.make data_len '0' in
-  String.blit reader.buffer !(reader.position) buffer 0 data_len;
-  reader.position := !(reader.position) + data_len;
-  Bytes.to_string buffer
+let read_string_of_len (reader : Eio.Buf_read.t) (len : int64) : string =
+  Eio.Buf_read.take (Int64.to_int len) reader
 
 let encode_bool (b : bool) : char = if b then 't' else 'f'
 
@@ -87,10 +73,10 @@ let encode_request_vote_input (message : Protocol.request_vote_input) =
   Buffer.add_int64_be buffer message.last_log_term;
   Buffer.contents buffer
 
-let decode_request_vote_input (buffer : string) : Protocol.request_vote_input =
-  let reader = create_string_reader buffer in
-
+let decode_request_vote_input (reader : Eio.Buf_read.t) :
+    Protocol.request_vote_input =
   let message_type = read_char reader in
+
   assert (message_type = message_type_request_vote_input);
 
   let term = read_int64_be reader in
@@ -111,14 +97,20 @@ let%test_unit "encode - decode request vote input" =
       last_log_term = 1L;
     }
   in
+
   assert (
-    message |> encode_request_vote_input |> decode_request_vote_input = message)
+    message |> encode_request_vote_input |> Eio.Flow.string_source
+    |> Eio.Buf_read.of_flow ~max_size:1_000_000_000
+    |> decode_request_vote_input = message)
 
 let%test_unit "quickcheck: encode - decode request vote input" =
   let test =
     QCheck.Test.make ~count:1000 ~name:"basic"
       (QCheck.make Protocol.gen_request_vote_input) (fun message ->
-        encode_request_vote_input message |> decode_request_vote_input = message)
+        encode_request_vote_input message
+        |> Eio.Flow.string_source
+        |> Eio.Buf_read.of_flow ~max_size:1_000_000_000
+        |> decode_request_vote_input = message)
   in
   QCheck.Test.check_exn test
 
@@ -130,11 +122,10 @@ let encode_request_vote_output (message : Protocol.request_vote_output) =
   Buffer.add_char buffer (encode_bool message.vote_granted);
   Buffer.contents buffer
 
-let decode_request_vote_output (buffer : string) : Protocol.request_vote_output
-    =
-  let reader = create_string_reader buffer in
-
+let decode_request_vote_output (reader : Eio.Buf_read.t) :
+    Protocol.request_vote_output =
   let message_type = read_char reader in
+
   assert (message_type = message_type_request_vote_output);
 
   let term = read_int64_be reader in
@@ -147,6 +138,8 @@ let%test_unit "quickcheck: encode - decode request vote output" =
     QCheck.Test.make ~count:1000 ~name:"basic"
       (QCheck.make Protocol.gen_request_vote_output) (fun message ->
         encode_request_vote_output message
+        |> Eio.Flow.string_source
+        |> Eio.Buf_read.of_flow ~max_size:1_000_000_000
         |> decode_request_vote_output = message)
   in
   QCheck.Test.check_exn test
@@ -156,13 +149,13 @@ let encode_entry (buffer : Buffer.t) (entry : Protocol.entry) : unit =
   Buffer.add_int64_be buffer (Int64.of_int (String.length entry.data));
   Buffer.add_string buffer entry.data
 
-let read_entry (reader : string_reader) : Protocol.entry =
+let read_entry (reader : Eio.Buf_read.t) : Protocol.entry =
   let term = read_int64_be reader in
   let data_len = read_int64_be reader in
   let data = read_string_of_len reader data_len in
   { term; data }
 
-let read_entries (reader : string_reader) : Protocol.entry list =
+let read_entries (reader : Eio.Buf_read.t) : Protocol.entry list =
   let num_entries = read_int64_be reader in
   List.init (Int64.to_int num_entries) (fun _ -> read_entry reader)
 
@@ -179,10 +172,8 @@ let encode_append_entries_input (message : Protocol.append_entries_input) =
   Buffer.add_int64_be buffer message.leader_commit;
   Buffer.contents buffer
 
-let decode_append_entries_input (buffer : string) :
+let decode_append_entries_input (reader : Eio.Buf_read.t) :
     Protocol.append_entries_input =
-  let reader = create_string_reader buffer in
-
   let message_type = read_char reader in
   assert (message_type = message_type_append_entries_input);
 
@@ -208,6 +199,8 @@ let%test_unit "quickcheck: encode - decode append entries input" =
     QCheck.Test.make ~count:1000 ~name:"basic"
       (QCheck.make Protocol.gen_append_entries_input) (fun message ->
         encode_append_entries_input message
+        |> Eio.Flow.string_source
+        |> Eio.Buf_read.of_flow ~max_size:1_000_000_000
         |> decode_append_entries_input = message)
   in
   QCheck.Test.check_exn test
@@ -221,10 +214,8 @@ let encode_append_entries_output (message : Protocol.append_entries_output) =
   Buffer.add_int32_be buffer message.replica_id;
   Buffer.contents buffer
 
-let decode_append_entries_output (buffer : string) :
+let decode_append_entries_output (reader : Eio.Buf_read.t) :
     Protocol.append_entries_output =
-  let reader = create_string_reader buffer in
-
   let message_type = read_char reader in
   assert (message_type = message_type_append_entries_output);
 
@@ -239,6 +230,8 @@ let%test_unit "quickcheck: encode - decode append entries output" =
     QCheck.Test.make ~count:1000 ~name:"basic"
       (QCheck.make Protocol.gen_append_entries_output) (fun message ->
         encode_append_entries_output message
+        |> Eio.Flow.string_source
+        |> Eio.Buf_read.of_flow ~max_size:1_000_000_000
         |> decode_append_entries_output = message)
   in
   QCheck.Test.check_exn test
@@ -259,6 +252,8 @@ let find_or_create_connection ~sw ~net ~connections ~cluster_members ~replica_id
         Ok flow
       with exn -> Error exn)
 
+let ignore_connection_exn_regex = Re.compile (Re.str "Connection refused")
+
 let send ~sw ~net ~connections ~cluster_members ~replica_id ~message =
   match
     find_or_create_connection ~sw ~net ~connections ~cluster_members ~replica_id
@@ -267,12 +262,40 @@ let send ~sw ~net ~connections ~cluster_members ~replica_id ~message =
       Eio.Buf_write.with_flow flow (fun to_server ->
           Eio.Buf_write.string to_server message)
   | Error exn ->
-      traceln "error trying to create connection with replica %ld err=%s"
-        replica_id (Printexc.to_string exn)
+      let err = Printexc.to_string exn in
 
-let receive flow : input_message =
-  Eio.Buf_read.with_flow flow (fun t -> assert false);
-  assert false
+      if not (Re.execp ignore_connection_exn_regex err) then
+        traceln "error trying to create connection with replica %ld err=%s"
+          replica_id err
+
+(* Reads an input_message from [flow] *)
+let receive buf_reader : input_message option =
+  match Eio.Buf_read.peek_char buf_reader with
+  | None ->
+      traceln
+        "unable to read char from buf reader, no message to receive, returning";
+      None
+  | Some message_type ->
+      traceln "receive: message_type=%c" message_type;
+      let message =
+        if message_type = message_type_request_vote_input then
+          RequestVote (decode_request_vote_input buf_reader)
+        else if message_type = message_type_request_vote_output then
+          RequestVoteOutput (decode_request_vote_output buf_reader)
+        else if message_type = message_type_append_entries_input then
+          AppendEntries (decode_append_entries_input buf_reader)
+        else if message_type = message_type_append_entries_output then
+          AppendEntriesOutput (decode_append_entries_output buf_reader)
+        else
+          let msg =
+            Printf.sprintf
+              "unknown message type received, this is a bug. message_type=%c"
+              message_type
+          in
+          traceln "%s" msg;
+          raise (Invalid_argument msg)
+      in
+      Some message
 
 (* TODO: Continue implementing the transport to send messages to replicas. *)
 let create ~sw ~net ~(config : config) : t =
@@ -280,21 +303,25 @@ let create ~sw ~net ~(config : config) : t =
   {
     send_request_vote_input =
       (fun replica_id message ->
+        traceln "sending request vote to replica %ld" replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_request_vote_input message));
     send_request_vote_output =
       (fun replica_id message ->
+        traceln "sending request vote output to replica %ld" replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_request_vote_output message));
     send_append_entries_input =
       (fun replica_id message ->
+        traceln "sending append entries to replica %ld" replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_append_entries_input message));
     send_append_entries_output =
       (fun replica_id message ->
+        traceln "sending append entries output to replica %ld" replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_append_entries_output message));

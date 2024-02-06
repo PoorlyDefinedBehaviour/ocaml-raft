@@ -4,19 +4,28 @@ let traceln fmt = traceln ("server: " ^^ fmt)
 
 let handle_client (replica : Replica.replica) flow addr =
   traceln "client connected. addr=%a" Eio.Net.Sockaddr.pp addr;
+  (* TODO: set max size to max the we may need (can the max append entries size in bytes be used here?) *)
+  let buf_reader = Eio.Buf_read.of_flow flow ~max_size:1_000_000_000 in
   let rec loop () =
-    let message : Replica.input_message =
-      traceln "replica %ld is waiting for a message from %a" replica.config.id
-        Eio.Net.Sockaddr.pp addr;
-      match Tcp_transport.receive flow with
-      | RequestVote message -> Replica.RequestVote message
-      | RequestVoteOutput message -> Replica.RequestVoteOutput message
-      | AppendEntries message -> Replica.AppendEntries message
-      | AppendEntriesOutput message -> Replica.AppendEntriesOutput message
-    in
-    Replica.handle_message replica message;
-    ()
+    traceln "replica %ld is waiting for a message from %a" replica.config.id
+      Eio.Net.Sockaddr.pp addr;
+    match Tcp_transport.receive buf_reader with
+    | None ->
+        traceln "client connection closed. addr=%a" Eio.Net.Sockaddr.pp addr
+    | Some message ->
+        let message : Replica.input_message =
+          match message with
+          | Tcp_transport.RequestVote message -> Replica.RequestVote message
+          | Tcp_transport.RequestVoteOutput message ->
+              Replica.RequestVoteOutput message
+          | Tcp_transport.AppendEntries message -> Replica.AppendEntries message
+          | Tcp_transport.AppendEntriesOutput message ->
+              Replica.AppendEntriesOutput message
+        in
+        Replica.handle_message replica message;
+        loop ()
   in
+
   loop ()
 
 let start ~(sw : Eio.Switch.t) ~socket

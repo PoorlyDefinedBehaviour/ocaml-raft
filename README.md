@@ -19,7 +19,4 @@ ID=2 dune exec ocaml_raft
 - Handle exceptions
 - Stop using lists
 - Check that data is correctly stored in the state file (look at the file contents and ensure there's nothing weird stored in there)
-
-## Where i stopped last time
-
-- Was trying to used the tcp connection to read messages from other replicas (there's a Eio.Net reading example in the ocaml eio repo.)
+- Remove completed todos

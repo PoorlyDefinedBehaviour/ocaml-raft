@@ -299,7 +299,7 @@ let handle_heartbeat_timeout_fired (replica : replica) :
     (* TODO: reset heartbeat timeout? *)
     List.filter_map
       (fun replica_id ->
-        if replica_id == replica.config.id then None
+        if replica_id = replica.config.id then None
         else Some (prepare_append_entries replica ~replica_id))
       replica.config.cluster_members
 

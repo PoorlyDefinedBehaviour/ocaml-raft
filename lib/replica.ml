@@ -266,7 +266,6 @@ let random_election_timeout (replica : replica) : timeout =
     version = Int64.add replica.volatile_state.next_election_timeout.version 1L;
   }
 
-(* TODO: continue testing *)
 let prepare_append_entries (replica : replica)
     ~(replica_id : Protocol.replica_id) : Protocol.append_entries_input =
   let next_index = Hashtbl.find replica.volatile_state.next_index replica_id in

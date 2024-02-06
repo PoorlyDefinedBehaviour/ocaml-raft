@@ -1,2 +1,2 @@
 _build/
-./ocaml_raft_dev/
+ocaml_raft_dev/

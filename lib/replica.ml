@@ -251,20 +251,18 @@ let handle_append_entries_output (replica : replica)
 
 (* Returns a timeout with a new version and the timeout time somewhere in the timeout range. *)
 let random_election_timeout (replica : replica) : timeout =
-  let now = Mtime_clock.now_ns () in
-  let timeout_at =
-    Int64.add now
-      ((* Convert from ms to ns because Mtime only works with ns. *)
-       Int64.mul
-         (replica.random.gen_range_int64
-            (* The election timeout config is in ms. *)
-            (Int64.of_int replica.config.election_timeout.min)
-            (Int64.of_int replica.config.election_timeout.max))
-         1_000_000L)
+  let timeout_ms =
+    replica.random.gen_range_int64
+      (* The election timeout config is in ms. *)
+      (Int64.of_int replica.config.election_timeout.min)
+      (Int64.of_int replica.config.election_timeout.max)
   in
 
+  (* Convert from ms to ns because Mtime only works with ns. *)
+  let timeout_ns = Int64.mul timeout_ms 1_000_000L in
+
   {
-    at = Mtime.of_uint64_ns timeout_at;
+    at = Mtime.of_uint64_ns timeout_ns;
     version = Int64.add replica.volatile_state.next_election_timeout.version 1L;
   }
 
@@ -432,10 +430,13 @@ and handle_append_entries (replica : replica) (message : append_entries_input) :
 and spawn_heartbeat_timeout_fiber (replica : replica) : unit =
   (* Spawning a fiber for each timeout is not necessary but I don't wanna spend more time on this project. *)
   Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
-      (* Sleep until until the moment the timeout should fire. *)
-      Eio.Time.Mono.sleep replica.clock
+      let duration_secs =
         (* Divide by 1000 to convert from ms to seconds. *)
-        (float_of_int replica.config.heartbeat_interval /. 1000.0);
+        float_of_int replica.config.heartbeat_interval /. 1000.0
+      in
+      traceln "aaaaaaa heartbeat timeout will fire in %fs" duration_secs;
+      (* Sleep until until the moment the timeout should fire. *)
+      Eio.Time.Mono.sleep replica.clock duration_secs;
 
       (* Let the replica that the timeout has fired. *)
       handle_message replica HeartbeatTimeoutFired;
@@ -455,48 +456,55 @@ and handle_heartbeat_timeout_fired (replica : replica) :
       replica.config.cluster_members)
 
 and start_election (replica : replica) : request_vote_input list =
-  (* Start a new term. *)
-  replica.persistent_state.current_term <-
-    Int64.add replica.persistent_state.current_term 1L;
-  replica.persistent_state.voted_for <- None;
-  replica.storage.persist replica.persistent_state;
-  replica.volatile_state.state <- Candidate;
+  if replica.volatile_state.state = Leader then []
+  else (
+    (* Start a new term. *)
+    replica.persistent_state.current_term <-
+      Int64.add replica.persistent_state.current_term 1L;
+    replica.persistent_state.voted_for <- None;
+    replica.storage.persist replica.persistent_state;
+    replica.volatile_state.state <- Candidate;
 
-  reset_election_timeout replica;
+    reset_election_timeout replica;
 
-  traceln "starting election. new term is %Ld"
-    replica.persistent_state.current_term;
+    traceln "starting election with term %Ld"
+      replica.persistent_state.current_term;
 
-  (* votes_received starts with the candidate because it votes for itself. *)
-  replica.volatile_state.election <-
-    { votes_received = ReplicaIdSet.add replica.config.id ReplicaIdSet.empty };
+    (* votes_received starts with the candidate because it votes for itself. *)
+    replica.volatile_state.election <-
+      { votes_received = ReplicaIdSet.add replica.config.id ReplicaIdSet.empty };
 
-  (* Return the massages that should be sent to the other members in the cluster. *)
-  List.filter_map
-    (fun replica_id ->
-      if replica_id <> replica.config.id then
-        Some
-          {
-            term = replica.persistent_state.current_term;
-            candidate_id = replica.config.id;
-            replica_id;
-            last_log_index = replica.storage.last_log_index ();
-            last_log_term = replica.storage.last_log_term ();
-          }
-      else None)
-    replica.config.cluster_members
+    (* Return the massages that should be sent to the other members in the cluster. *)
+    List.filter_map
+      (fun replica_id ->
+        if replica_id <> replica.config.id then
+          Some
+            {
+              term = replica.persistent_state.current_term;
+              candidate_id = replica.config.id;
+              replica_id;
+              last_log_index = replica.storage.last_log_index ();
+              last_log_term = replica.storage.last_log_term ();
+            }
+        else None)
+      replica.config.cluster_members)
 
 and reset_election_timeout (replica : replica) : unit =
   let timeout = random_election_timeout replica in
-  traceln "next election timeout at: %a" Mtime.pp timeout.at;
-
   replica.volatile_state.next_election_timeout <- timeout;
 
   (* Spawning a fiber for each timeout is not necessary but I don't wanna spend more time on this project. *)
   Eio.Fiber.fork_daemon ~sw:replica.sw (fun () ->
       (* Sleep until until the moment the timeout should fire. *)
-      Eio.Time.Mono.sleep_until replica.clock
-        replica.volatile_state.next_election_timeout.at;
+      let duration_ms =
+        Int64.div
+          (Mtime.to_uint64_ns replica.volatile_state.next_election_timeout.at)
+          1000000L
+      in
+
+      let duration_secs = Int64.to_float duration_ms /. 1000.0 in
+
+      Eio.Time.Mono.sleep replica.clock duration_secs;
 
       (* Let the replica that the timeout has fired. *)
       handle_message replica (ElectionTimeoutFired timeout);
@@ -506,11 +514,11 @@ and reset_election_timeout (replica : replica) : unit =
 (* TODO: add heartbeat timeout and send heartbeat on timeout *)
 and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
-      traceln "handling message: current_term=%Ld %s"
-        replica.persistent_state.current_term
-        (show_input_message input_message);
       match input_message with
       | HeartbeatTimeoutFired ->
+          traceln "handling message: current_term=%Ld %s"
+            replica.persistent_state.current_term
+            (show_input_message input_message);
           List.iter
             (fun (message : Protocol.append_entries_input) ->
               replica.transport.send_append_entries_input message.replica_id
@@ -522,27 +530,42 @@ and handle_message (replica : replica) (input_message : input_message) =
           if
             timeout.version
             = replica.volatile_state.next_election_timeout.version
-          then
+          then (
+            traceln "handling message: current_term=%Ld %s"
+              replica.persistent_state.current_term
+              (show_input_message input_message);
             start_election replica
             |> List.iter (fun (message : request_vote_input) ->
                    replica.transport.send_request_vote_input message.replica_id
-                     message)
+                     message))
       | RequestVote message ->
+          traceln "handling message: current_term=%Ld %s"
+            replica.persistent_state.current_term
+            (show_input_message input_message);
           let output_message = handle_request_vote replica message in
           replica.transport.send_request_vote_output
             (replica_id_of_input_message input_message)
             output_message
       | RequestVoteOutput message ->
+          traceln "handling message: current_term=%Ld %s"
+            replica.persistent_state.current_term
+            (show_input_message input_message);
           handle_request_vote_output replica message
           |> List.iter (fun (message : Protocol.append_entries_input) ->
                  replica.transport.send_append_entries_input message.replica_id
                    message)
       | AppendEntries message ->
+          traceln "handling message: current_term=%Ld %s"
+            replica.persistent_state.current_term
+            (show_input_message input_message);
           let output_message = handle_append_entries replica message in
           replica.transport.send_append_entries_output
             (replica_id_of_input_message input_message)
             output_message
       | AppendEntriesOutput message -> (
+          traceln "handling message: current_term=%Ld %s"
+            replica.persistent_state.current_term
+            (show_input_message input_message);
           match handle_append_entries_output replica message with
           | `Ignore -> ()
           | `ResendAppendEntries ->
@@ -1528,5 +1551,7 @@ let%test_unit "handle_message: election timeout fired" =
 
 let%test_unit "random_election_timeout: returns a random timeout that's in the \
                timeout range" =
-  (* TODO *)
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  let timeout = random_election_timeout sut.replica in
+
   assert false

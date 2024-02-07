@@ -276,7 +276,6 @@ let receive buf_reader : input_message option =
         "unable to read char from buf reader, no message to receive, returning";
       None
   | Some message_type ->
-      traceln "receive: message_type=%c" message_type;
       let message =
         if message_type = message_type_request_vote_input then
           RequestVote (decode_request_vote_input buf_reader)
@@ -303,33 +302,21 @@ let create ~sw ~net ~(config : config) : t =
   {
     send_request_vote_input =
       (fun replica_id message ->
-        traceln "sending RequestVote %s to replica %ld"
-          (Protocol.show_request_vote_input message)
-          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_request_vote_input message));
     send_request_vote_output =
       (fun replica_id message ->
-        traceln "sending RequestVoteOutput %s to replica %ld"
-          (Protocol.show_request_vote_output message)
-          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_request_vote_output message));
     send_append_entries_input =
       (fun replica_id message ->
-        traceln "sending AppendEntries %s to replica %ld"
-          (Protocol.show_append_entries_input message)
-          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_append_entries_input message));
     send_append_entries_output =
       (fun replica_id message ->
-        traceln "sending AppendEntriesOutput %s to replica %ld"
-          (Protocol.show_append_entries_output message)
-          replica_id;
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(encode_append_entries_output message));

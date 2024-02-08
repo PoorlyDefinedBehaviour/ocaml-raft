@@ -250,21 +250,19 @@ let handle_append_entries_output (replica : replica)
     `ResendAppendEntries)
 
 (* Returns a timeout with a new version and the timeout time somewhere in the timeout range. *)
-let random_election_timeout (replica : replica) : timeout =
+let random_election_timeout (random : Rand.t) (range : range) (version : int64)
+    : timeout =
   let timeout_ms =
-    replica.random.gen_range_int64
+    random.gen_range_int64
       (* The election timeout config is in ms. *)
-      (Int64.of_int replica.config.election_timeout.min)
-      (Int64.of_int replica.config.election_timeout.max)
+      (Int64.of_int range.min)
+      (Int64.of_int range.max)
   in
 
   (* Convert from ms to ns because Mtime only works with ns. *)
   let timeout_ns = Int64.mul timeout_ms 1_000_000L in
 
-  {
-    at = Mtime.of_uint64_ns timeout_ns;
-    version = Int64.add replica.volatile_state.next_election_timeout.version 1L;
-  }
+  { at = Mtime.of_uint64_ns timeout_ns; version = Int64.add version 1L }
 
 let prepare_append_entries (replica : replica)
     ~(replica_id : Protocol.replica_id) : Protocol.append_entries_input =
@@ -490,7 +488,10 @@ and start_election (replica : replica) : request_vote_input list =
       replica.config.cluster_members)
 
 and reset_election_timeout (replica : replica) : unit =
-  let timeout = random_election_timeout replica in
+  let timeout =
+    random_election_timeout replica.random replica.config.election_timeout
+      replica.volatile_state.next_election_timeout.version
+  in
   replica.volatile_state.next_election_timeout <- timeout;
 
   (* Spawning a fiber for each timeout is not necessary but I don't wanna spend more time on this project. *)
@@ -1551,7 +1552,24 @@ let%test_unit "handle_message: election timeout fired" =
 
 let%test_unit "random_election_timeout: returns a random timeout that's in the \
                timeout range" =
-  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
-  let timeout = random_election_timeout sut.replica in
+  let test =
+    QCheck.Test.make ~count:1000 ~name:"basic"
+      (QCheck.tup3 QCheck.small_int QCheck.small_int QCheck.small_int)
+      (fun (a, b, version) ->
+        let a = abs a in
+        let b = abs b in
+        let version = abs version in
 
-  assert false
+        let range = { min = min a b; max = max a b } in
+        let rand = Rand.create () in
+        let version = Int64.of_int version in
+
+        let timeout = random_election_timeout rand range version in
+
+        let at =
+          Int64.to_int (Int64.div (Mtime.to_uint64_ns timeout.at) 1_000_000L)
+        in
+        timeout.version = Int64.add 1L version
+        && at >= range.min && at <= range.max)
+  in
+  QCheck.Test.check_exn test

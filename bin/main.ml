@@ -45,10 +45,12 @@ let main ~net ~clock =
           append_entries_max_batch_size_in_bytes = 4096;
         }
       in
-      traceln "starting raft server. replica_id=%ld addr=%a" replica_id
-        Eio.Net.Sockaddr.pp addr;
-      Raft.Server.start ~sw ~clock ~socket ~transport ~storage ~random
-        ~fsm_apply:(Raft.Kv.apply kv) ~config)
+      let replica =
+        Raft.Replica.create ~sw ~clock ~config ~transport ~storage ~random
+          ~initial_state:(storage.initial_state ())
+          ~fsm_apply:(Raft.Kv.apply kv)
+      in
+      Raft.Server.start ~socket ~replica)
 
 let () =
   Eio_main.run (fun env ->

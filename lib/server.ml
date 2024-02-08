@@ -26,14 +26,9 @@ let handle_client (replica : Replica.replica) flow addr =
 
   loop ()
 
-let start ~(sw : Eio.Switch.t) ~socket
-    ~(clock : Mtime.t Eio.Time.clock_ty Eio.Resource.t)
-    ~(config : Replica.config) ~(transport : Tcp_transport.t)
-    ~(storage : Disk_storage.t) ~(random : Rand.t) ~fsm_apply =
-  let replica =
-    Replica.create ~sw ~clock ~config ~transport ~storage ~random
-      ~initial_state:(storage.initial_state ()) ~fsm_apply
-  in
+let start ~socket ~(replica : Replica.replica) =
+  (* TODO: accept tcp connections from clients *)
+  assert false 
   traceln "starting TCP server";
   Eio.Net.run_server socket (handle_client replica)
     ~on_error:(Eio.Std.traceln "Error handling connection: %a" Fmt.exn)

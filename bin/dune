@@ -1,6 +1,6 @@
-(executable
- (public_name ocaml_raft)
- (name main)
+(executables
+ (public_names server client)
+ (names server client)
  (libraries raft eio eio_main))
 
 (env

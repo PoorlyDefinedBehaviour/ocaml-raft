@@ -2,13 +2,13 @@
 
 ```
 # Terminal 1
-ID=0 dune exec ocaml_raft
+ID=0 dune exec server
 
 # Terminal 2
-ID=1 dune exec ocaml_raft
+ID=1 dune exec server
 
 # Terminal 3
-ID=2 dune exec ocaml_raft
+ID=2 dune exec server
 ```
 
 ## TODO

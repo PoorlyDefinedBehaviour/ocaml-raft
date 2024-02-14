@@ -28,7 +28,6 @@ let handle_client (replica : Replica.replica) flow addr =
 
 let start ~socket ~(replica : Replica.replica) =
   (* TODO: accept tcp connections from clients *)
-  assert false 
   traceln "starting TCP server";
   Eio.Net.run_server socket (handle_client replica)
     ~on_error:(Eio.Std.traceln "Error handling connection: %a" Fmt.exn)

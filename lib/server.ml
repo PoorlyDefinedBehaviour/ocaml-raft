@@ -2,14 +2,14 @@ open Eio.Std
 
 let traceln fmt = traceln ("server: " ^^ fmt)
 
-let handle_client (replica : Replica.replica) flow addr =
-  traceln "client connected. addr=%a" Eio.Net.Sockaddr.pp addr;
+let handle_replica_conn (replica : Replica.replica) flow addr =
+  traceln "replica connected. addr=%a" Eio.Net.Sockaddr.pp addr;
   (* TODO: set max size to max the we may need (can the max append entries size in bytes be used here?) *)
   let buf_reader = Eio.Buf_read.of_flow flow ~max_size:1_000_000_000 in
   let rec loop () =
     match Tcp_transport.receive buf_reader with
     | None ->
-        traceln "client connection closed. addr=%a" Eio.Net.Sockaddr.pp addr
+        traceln "replica connection closed. addr=%a" Eio.Net.Sockaddr.pp addr
     | Some message ->
         let message : Replica.input_message =
           match message with
@@ -23,12 +23,36 @@ let handle_client (replica : Replica.replica) flow addr =
         Replica.handle_message replica message;
         loop ()
   in
-
   loop ()
 
-let start ~socket ~(replica : Replica.replica) =
-  (* TODO: accept tcp connections from clients *)
-  traceln "starting TCP server";
-  Eio.Net.run_server socket (handle_client replica)
-    ~on_error:(Eio.Std.traceln "Error handling connection: %a" Fmt.exn)
-    ~max_connections:1000
+ 
+
+let handle_client_conn (replica: Replica.replica) flow addr =
+  traceln "client connected. addr=%a" Eio.Net.Sockaddr.pp addr
+  (* TODO: set max size to max the we may need (can the max append entries size in bytes be used here?) *)
+  let buf_reader = Eio.Buf_read.of_flow flow ~max_size:1_000_000_000 in
+  let rec loop () =
+    match Tcp_transport.receive_client_request buf_reader with
+    | None ->
+        traceln "client connection closed. addr=%a" Eio.Net.Sockaddr.pp addr
+    | Some message ->
+        replica.handle_message
+        loop ()
+  in
+  loop ()
+
+let start ~replicas_socket ~clients_socket ~(replica : Replica.replica) =
+  Eio.Fiber.both
+    (fun () ->
+      traceln "starting TCP server for replica connections";
+      Eio.Net.run_server replicas_socket
+        (handle_replica_conn replica)
+        ~on_error:
+          (Eio.Std.traceln "Error handling replica connection: %a" Fmt.exn)
+        ~max_connections:1000)
+    (fun () ->
+      traceln "starting TCP server for client connections";
+      Eio.Net.run_server clients_socket handle_client_conn
+        ~on_error:
+          (Eio.Std.traceln "Error handling client connection: %a" Fmt.exn)
+        ~max_connections:1000)

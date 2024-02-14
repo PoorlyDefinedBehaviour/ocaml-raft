@@ -77,6 +77,8 @@ type replica = {
 (* Contains messages that can be received from other replicas and
    messages sent from this replica to itself (without using the network) *)
 type input_message =
+  (* A request received from a client. *)
+  | ClientRequest of string
   (* The heartbeat timeout has fired. *)
   | HeartbeatTimeoutFired
   (* The election timeout has fired. *)
@@ -96,6 +98,7 @@ let term_of_input_message (message : input_message) : Protocol.term =
   match message with
   | RequestVote message -> message.term
   | AppendEntries message -> message.leader_term
+  | ClientRequest _ -> invalid_arg "ClientRequest"
   | HeartbeatTimeoutFired -> invalid_arg "HeartbeatTimeoutFired"
   | ElectionTimeoutFired _ -> invalid_arg "ElectionTimeoutFired"
   | AppendEntriesOutput _ -> invalid_arg "AppendEntriesOutput"
@@ -107,6 +110,7 @@ let replica_id_of_input_message (message : input_message) : Protocol.replica_id
   match message with
   | RequestVote message -> message.candidate_id
   | AppendEntries message -> message.leader_id
+  | ClientRequest _ -> invalid_arg "ClientRequest"
   | HeartbeatTimeoutFired -> invalid_arg "HeartbeatTimeoutFired"
   | ElectionTimeoutFired _ -> invalid_arg "ElectionTimeoutFired"
   | AppendEntriesOutput _ -> invalid_arg "AppendEntriesOutput"
@@ -516,6 +520,9 @@ and reset_election_timeout (replica : replica) : unit =
 and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
       match input_message with
+      | ClientRequest request ->
+          (* TODO: handle client request *)
+          assert false
       | HeartbeatTimeoutFired ->
           traceln "handling message: current_term=%Ld %s"
             replica.persistent_state.current_term

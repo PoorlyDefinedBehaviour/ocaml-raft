@@ -296,7 +296,16 @@ let receive buf_reader : input_message option =
       in
       Some message
 
-(* TODO: Continue implementing the transport to send messages to replicas. *)
+let receive_client_request buf_reader : string option =
+  match Eio.Buf_read.peek_char buf_reader with
+  | None ->
+      traceln
+        "unable to read char from buf reader, no message to receive, returning";
+      None
+  | Some _ ->
+      let len = read_int64_be buf_reader in
+      Some (read_string_of_len buf_reader len)
+
 let create ~sw ~net ~(config : config) : t =
   let connections = Hashtbl.create 0 in
   {

@@ -1,6 +1,6 @@
 open Eio.Std
 
-let traceln fmt = traceln ("bin/main: " ^^ fmt)
+let traceln fmt = traceln ("bin/server: " ^^ fmt)
 
 let main ~net ~clock =
   Switch.run ~name:"main" (fun sw ->
@@ -10,9 +10,6 @@ let main ~net ~clock =
             raise
               (Invalid_argument "ID env variable must be an int between 0 and 2")
         | Some v -> v |> int_of_string |> Int32.of_int
-      in
-      let addr =
-        `Tcp (Eio.Net.Ipaddr.V4.loopback, 8000 + Int32.to_int replica_id)
       in
       let random = Raft.Rand.create () in
       let cluster_members = [ 0l; 1l; 2l ] in
@@ -24,7 +21,14 @@ let main ~net ~clock =
           (2l, `Tcp (Eio.Net.Ipaddr.V4.loopback, 8003));
         ]
       in
-      let socket = Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:10 addr in
+      let replicas_socket =
+        Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:10
+          (`Tcp (Eio.Net.Ipaddr.V4.loopback, 8000 + Int32.to_int replica_id))
+      in
+      let clients_socket =
+        Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:10
+          (`Tcp (Eio.Net.Ipaddr.V4.loopback, 9000 + Int32.to_int replica_id))
+      in
       let transport =
         Raft.Tcp_transport.create ~sw ~net
           ~config:{ cluster_members = cluster_members_with_addresses }
@@ -50,7 +54,8 @@ let main ~net ~clock =
           ~initial_state:(storage.initial_state ())
           ~fsm_apply:(Raft.Kv.apply kv)
       in
-      Raft.Server.start ~socket ~replica)
+      let _ = Raft.Server.start ~replicas_socket ~clients_socket ~replica in
+      assert false)
 
 let () =
   Eio_main.run (fun env ->

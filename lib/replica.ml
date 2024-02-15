@@ -1,8 +1,6 @@
 open Protocol
 module ReplicaIdSet = Set.Make (Int32)
 
-let traceln fmt = Eio.Std.traceln ("replica: " ^^ fmt)
-
 type election = {
   (* A set containing the id of the replicas that voted for the candidate. *)
   mutable votes_received : ReplicaIdSet.t; [@opaque]
@@ -35,6 +33,8 @@ type volatile_state = {
   mutable next_index : (Protocol.replica_id, int64) Hashtbl.t; [@opaque]
   (* For each server, the index of the last log entry known to be replicated on the server (initialized to 0, increases monotonically) *)
   mutable match_index : (Protocol.replica_id, int64) Hashtbl.t; [@opaque]
+  (* The id of the latest replica to send a successful append entries request. *)
+  mutable current_leader : Protocol.replica_id option;
 }
 [@@deriving show]
 
@@ -74,11 +74,22 @@ type replica = {
 }
 [@@deriving show]
 
+type client_request_result =
+  | NotCurrentLeader of Protocol.replica_id option
+  | SendAppendEntries of Protocol.append_entries_input list
+[@@deriving show]
+
+type client_request = {
+  payload : string;
+  send_response : client_request_result -> unit;
+}
+[@@deriving show]
+
 (* Contains messages that can be received from other replicas and
    messages sent from this replica to itself (without using the network) *)
 type input_message =
   (* A request received from a client. *)
-  | ClientRequest of string
+  | ClientRequest of client_request
   (* The heartbeat timeout has fired. *)
   | HeartbeatTimeoutFired
   (* The election timeout has fired. *)
@@ -131,8 +142,6 @@ let has_voted_for_other_candidate (replica : replica)
 
 (* Called when a replica with a higher term is found. *)
 let transition_to_higher_term (replica : replica) (term : term) : unit =
-  traceln "found higher term. current_term=%Ld new_term=%Ld"
-    replica.persistent_state.current_term term;
   replica.persistent_state.current_term <- term;
   replica.volatile_state.state <- Follower;
   replica.persistent_state.voted_for <- None
@@ -292,6 +301,23 @@ let prepare_append_entries (replica : replica)
     leader_commit = replica.volatile_state.commit_index;
   }
 
+let handle_client_request (replica : replica) (request : client_request) :
+    client_request_result =
+  if replica.volatile_state.state <> Leader then
+    NotCurrentLeader replica.volatile_state.current_leader
+  else
+    let entry =
+      { term = replica.persistent_state.current_term; data = request.payload }
+    in
+    replica.storage.append_entries (replica.storage.last_log_index ()) [ entry ];
+    (* TODO: need to send reply to client when replication is complete *)
+    SendAppendEntries
+      (List.filter_map
+         (fun replica_id ->
+           if replica_id = replica.config.id then None
+           else Some (prepare_append_entries replica ~replica_id))
+         replica.config.cluster_members)
+
 let rec handle_request_vote (replica : replica) (message : request_vote_input) :
     request_vote_output =
   if message.term > replica.persistent_state.current_term then
@@ -324,13 +350,9 @@ let rec handle_request_vote (replica : replica) (message : request_vote_input) :
   in
   replica.storage.persist replica.persistent_state;
   if response.vote_granted then reset_election_timeout replica;
-  traceln "handle_request_vote. message=%s response=%s"
-    (Protocol.show_request_vote_input message)
-    (Protocol.show_request_vote_output response);
   response
 
 and become_leader (replica : replica) : unit =
-  traceln "transitioning to leader";
   replica.volatile_state.state <- Leader;
   spawn_heartbeat_timeout_fiber replica
 
@@ -422,6 +444,8 @@ and handle_append_entries (replica : replica) (message : append_entries_input) :
 
     reset_election_timeout replica;
 
+    replica.volatile_state.current_leader <- Some message.leader_id;
+
     {
       term = replica.persistent_state.current_term;
       success = true;
@@ -436,7 +460,7 @@ and spawn_heartbeat_timeout_fiber (replica : replica) : unit =
         (* Divide by 1000 to convert from ms to seconds. *)
         float_of_int replica.config.heartbeat_interval /. 1000.0
       in
-      traceln "aaaaaaa heartbeat timeout will fire in %fs" duration_secs;
+
       (* Sleep until until the moment the timeout should fire. *)
       Eio.Time.Mono.sleep replica.clock duration_secs;
 
@@ -450,7 +474,7 @@ and handle_heartbeat_timeout_fired (replica : replica) :
   if replica.volatile_state.state <> Leader then []
   else (
     spawn_heartbeat_timeout_fiber replica;
-    (* TODO: reset heartbeat timeout? *)
+
     List.filter_map
       (fun replica_id ->
         if replica_id = replica.config.id then None
@@ -468,9 +492,6 @@ and start_election (replica : replica) : request_vote_input list =
     replica.volatile_state.state <- Candidate;
 
     reset_election_timeout replica;
-
-    traceln "starting election with term %Ld"
-      replica.persistent_state.current_term;
 
     (* votes_received starts with the candidate because it votes for itself. *)
     replica.volatile_state.election <-
@@ -524,9 +545,6 @@ and handle_message (replica : replica) (input_message : input_message) =
           (* TODO: handle client request *)
           assert false
       | HeartbeatTimeoutFired ->
-          traceln "handling message: current_term=%Ld %s"
-            replica.persistent_state.current_term
-            (show_input_message input_message);
           List.iter
             (fun (message : Protocol.append_entries_input) ->
               replica.transport.send_append_entries_input message.replica_id
@@ -538,42 +556,27 @@ and handle_message (replica : replica) (input_message : input_message) =
           if
             timeout.version
             = replica.volatile_state.next_election_timeout.version
-          then (
-            traceln "handling message: current_term=%Ld %s"
-              replica.persistent_state.current_term
-              (show_input_message input_message);
+          then
             start_election replica
             |> List.iter (fun (message : request_vote_input) ->
                    replica.transport.send_request_vote_input message.replica_id
-                     message))
+                     message)
       | RequestVote message ->
-          traceln "handling message: current_term=%Ld %s"
-            replica.persistent_state.current_term
-            (show_input_message input_message);
           let output_message = handle_request_vote replica message in
           replica.transport.send_request_vote_output
             (replica_id_of_input_message input_message)
             output_message
       | RequestVoteOutput message ->
-          traceln "handling message: current_term=%Ld %s"
-            replica.persistent_state.current_term
-            (show_input_message input_message);
           handle_request_vote_output replica message
           |> List.iter (fun (message : Protocol.append_entries_input) ->
                  replica.transport.send_append_entries_input message.replica_id
                    message)
       | AppendEntries message ->
-          traceln "handling message: current_term=%Ld %s"
-            replica.persistent_state.current_term
-            (show_input_message input_message);
           let output_message = handle_append_entries replica message in
           replica.transport.send_append_entries_output
             (replica_id_of_input_message input_message)
             output_message
       | AppendEntriesOutput message -> (
-          traceln "handling message: current_term=%Ld %s"
-            replica.persistent_state.current_term
-            (show_input_message input_message);
           match handle_append_entries_output replica message with
           | `Ignore -> ()
           | `ResendAppendEntries ->
@@ -588,9 +591,6 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : Tcp_transport.t) ~(storage : Disk_storage.t)
     ~(initial_state : initial_state) ~(fsm_apply : Protocol.entry -> unit)
     ~(random : Rand.t) : replica =
-  traceln "creating replica. config=%s initial_state=%s" (show_config config)
-    (show_initial_state initial_state);
-
   let replica =
     {
       config;
@@ -621,6 +621,7 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
                    Hashtbl.replace hash_table replica_id 0L)
                config.cluster_members;
              hash_table);
+          current_leader = None;
         };
       storage;
       transport;
@@ -781,6 +782,85 @@ let with_test_cluster (f : test_cluster -> unit) =
       Eio.Switch.run (fun sw ->
           let cluster = test_cluster ~sw ~clock:(Eio.Stdenv.mono_clock env) in
           f cluster))
+
+let%test_unit "handle_client_request: if replica is not the leader, the id of \
+               the leader is returned" =
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  (* When the replica does not know who the leader is. *)
+  assert (
+    handle_client_request sut.replica
+      { payload = "hello"; send_response = (fun _ -> ()) }
+    = NotCurrentLeader None);
+
+  (* When the replica knows who the leader is. *)
+  sut.replica.volatile_state.current_leader <- Some 3l;
+  assert (
+    handle_client_request sut.replica
+      { payload = "hello"; send_response = (fun _ -> ()) }
+    = NotCurrentLeader (Some 3l))
+
+let%test_unit "handle_client_request: when replica is the leader" =
+  with_test_cluster @@ fun cluster ->
+  let sut = List.hd cluster.replicas in
+  sut.replica.volatile_state.state <- Leader;
+
+  assert (
+    handle_client_request sut.replica
+      { payload = "hello 1"; send_response = (fun _ -> ()) }
+    = SendAppendEntries
+        [
+          {
+            leader_term = 0L;
+            leader_id = 0l;
+            replica_id = 1l;
+            previous_log_index = 0L;
+            previous_log_term = 0L;
+            entries = [ { term = 0L; data = "hello 1" } ];
+            leader_commit = 0L;
+          };
+          {
+            leader_term = 0L;
+            leader_id = 0l;
+            replica_id = 2l;
+            previous_log_index = 0L;
+            previous_log_term = 0L;
+            entries = [ { term = 0L; data = "hello 1" } ];
+            leader_commit = 0L;
+          };
+        ]);
+
+  assert (
+    handle_client_request sut.replica
+      { payload = "hello 2"; send_response = (fun _ -> ()) }
+    = SendAppendEntries
+        [
+          {
+            Protocol.leader_term = 0L;
+            leader_id = 0l;
+            replica_id = 1l;
+            previous_log_index = 0L;
+            previous_log_term = 0L;
+            entries =
+              [
+                { Protocol.term = 0L; data = "hello 2" };
+                { Protocol.term = 0L; data = "hello 1" };
+              ];
+            leader_commit = 0L;
+          };
+          {
+            Protocol.leader_term = 0L;
+            leader_id = 0l;
+            replica_id = 2l;
+            previous_log_index = 0L;
+            previous_log_term = 0L;
+            entries =
+              [
+                { Protocol.term = 0L; data = "hello 2" };
+                { Protocol.term = 0L; data = "hello 1" };
+              ];
+            leader_commit = 0L;
+          };
+        ])
 
 let%test_unit "request vote: replica receives message with higher term -> \
                updates term, transitions to follower and resets voted for, \
@@ -1089,6 +1169,12 @@ let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
           leader_commit = sut.replica.volatile_state.commit_index;
         };
       ])
+
+let%test_unit "append entries: replicas keep track of the current leader. \
+               current leader is updated when append entries succeeds" =
+  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
+  (* TODO *)
+  assert false
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
   with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->

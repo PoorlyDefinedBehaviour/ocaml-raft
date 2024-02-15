@@ -1,18 +1,12 @@
-let traceln fmt = Eio.Std.traceln ("kv: " ^^ fmt)
-
 type t = { entries : (string, string) Hashtbl.t }
 
 let create () : t = { entries = Hashtbl.create 0 }
 
 let apply (kv : t) (entry : Protocol.entry) : unit =
-  traceln "applying entry. entry=%s" (Protocol.show_entry entry);
-
   let key_len = Int32.to_int (String.get_int32_be entry.data 0) in
   let key = String.sub entry.data 4 key_len in
   let value_len = Int32.to_int (String.get_int32_be entry.data (4 + key_len)) in
   let value = String.sub entry.data (4 + key_len + 4) value_len in
-
-  Printf.printf "applying entry. key=%s value=%s\n" key value;
 
   Hashtbl.replace kv.entries key value
 

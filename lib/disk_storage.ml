@@ -349,6 +349,11 @@ let create (config : config) : t =
         get_entry_batch storage ~from_index ~max_size_bytes);
   }
 
+let%test_unit "first_log_index_with_latest_term: returns the index of the \
+               first entry with the latest term" =
+  (* TODO: ensure it works when the disk_storage is reinstantiated. *)
+  assert false
+
 let%test_unit "append entries: updates first log index with latest term" =
   let storage = make { dir = Test_util.temp_dir () } in
 

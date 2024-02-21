@@ -36,7 +36,8 @@ let handle_client_conn (replica : Replica.replica) flow addr =
     | Some payload ->
         Replica.handle_message replica
           (Replica.ClientRequest
-             { payload; send_response = (fun result -> assert false) });
+             (* TODO: send response to client *)
+             { payload; send_response = (fun _ -> assert false) });
 
         loop ()
   in

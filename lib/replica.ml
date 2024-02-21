@@ -75,13 +75,29 @@ type replica = {
 [@@deriving show]
 
 type client_request_result =
+  (* The replica cannot handle the client request because it is not the leader.
+     The leader id is included if the replica knows who the leader is. *)
   | NotCurrentLeader of Protocol.replica_id option
+  (* The replica is the leader and will send append entries request to other replicas
+       to replicate the client entry. *)
   | SendAppendEntries of Protocol.append_entries_input list
 [@@deriving show]
 
+(* Represents a response to a client request. The response is sent using the callback in `client_request` *)
+type client_request_response =
+  (* The replica is not the leader and doesn't know who the leader is. *)
+  | UnknownLeader
+  (* The replica is not the leader but knows who the leader is. *)
+  | RedirectToLeader of Protocol.replica_id
+  (* The replica is the leader and has replicated the client entry. *)
+  | ReplicationComplete
+
+(* Represents a request received from a client that believes the replica is the leader. *)
 type client_request = {
+  (* The payload sent by the client. *)
   payload : string;
-  send_response : client_request_result -> unit;
+  (* Callback to send a response to the client. *)
+  send_response : client_request_response -> unit;
 }
 [@@deriving show]
 
@@ -537,13 +553,20 @@ and reset_election_timeout (replica : replica) : unit =
 
       `Stop_daemon)
 
-(* TODO: add heartbeat timeout and send heartbeat on timeout *)
 and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
       match input_message with
-      | ClientRequest request ->
-          (* TODO: handle client request *)
-          assert false
+      | ClientRequest request -> (
+          match handle_client_request replica request with
+          | NotCurrentLeader None -> request.send_response UnknownLeader
+          | NotCurrentLeader (Some leader_id) ->
+              request.send_response (RedirectToLeader leader_id)
+          | SendAppendEntries entries ->
+              List.iter
+                (fun (entry : Protocol.append_entries_input) ->
+                  replica.transport.send_append_entries_input entry.replica_id
+                    entry)
+                entries)
       | HeartbeatTimeoutFired ->
           List.iter
             (fun (message : Protocol.append_entries_input) ->
@@ -634,7 +657,6 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
 
 (* Returns a Disk_storage instance which writes to a temp folder. *)
 let test_disk_storage ~(dir : string) : Disk_storage.t =
-  Printf.printf "Disk_storage dir = %s\n" dir;
   Disk_storage.create { dir }
 
 type test_replica = {
@@ -1172,9 +1194,27 @@ let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
 
 let%test_unit "append entries: replicas keep track of the current leader. \
                current leader is updated when append entries succeeds" =
-  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
-  (* TODO *)
-  assert false
+  with_test_replica { current_term = 0L; voted_for = None } @@ fun sut ->
+  (* Replica doesn't know who the leader is. *)
+  assert (sut.replica.volatile_state.current_leader = None);
+
+  (* Replica receives append entries request from leader. *)
+  let response =
+    handle_append_entries sut.replica
+      {
+        leader_term = 1L;
+        leader_id = 1l;
+        replica_id = 0l;
+        previous_log_index = 0L;
+        previous_log_term = 0L;
+        entries = [ { term = 1L; data = "1" }; { term = 1L; data = "2" } ];
+        leader_commit = 0L;
+      }
+  in
+  assert response.success;
+
+  (* Replica knows who the current leader is after append entries request succeeds. *)
+  assert (sut.replica.volatile_state.current_leader = Some 1l)
 
 let%test_unit "append entries: message.term < replica.term, reject request" =
   with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->

@@ -32,6 +32,9 @@ let message_type_request_vote_input = '1'
 let message_type_request_vote_output = '2'
 let message_type_append_entries_input = '3'
 let message_type_append_entries_output = '4'
+let message_type_client_request_response_unknown_leader = '5'
+let message_type_client_request_response_redirect_to_leader = '6'
+let message_type_client_request_response_success = '7'
 
 type config = {
   cluster_members : (Protocol.replica_id * Eio.Net.Sockaddr.stream) list;
@@ -305,6 +308,49 @@ let receive_client_request buf_reader : string option =
   | Some _ ->
       let len = read_int64_be buf_reader in
       Some (read_string_of_len buf_reader len)
+
+let encode_client_request_response (response : Protocol.client_request_response)
+    : string =
+  let buffer = Buffer.create 0 in
+  (match response with
+  | UnknownLeader ->
+      Buffer.add_char buffer message_type_client_request_response_unknown_leader
+  | RedirectToLeader leader_id ->
+      Buffer.add_char buffer
+        message_type_client_request_response_redirect_to_leader;
+      Buffer.add_int32_be buffer leader_id
+  | ReplicationComplete ->
+      Buffer.add_char buffer message_type_client_request_response_success);
+  Buffer.contents buffer
+
+let decode_client_request_response (reader : Eio.Buf_read.t) :
+    Protocol.client_request_response =
+  let message_type = read_char reader in
+  if message_type = message_type_client_request_response_unknown_leader then
+    Protocol.UnknownLeader
+  else if message_type = message_type_client_request_response_redirect_to_leader
+  then
+    let leader_id = read_int32_be reader in
+    Protocol.RedirectToLeader leader_id
+  else if message_type = message_type_client_request_response_success then
+    Protocol.ReplicationComplete
+  else
+    raise
+      (Invalid_argument
+         (Printf.sprintf
+            "decode_client_request_response: unknown message type: %c"
+            message_type))
+
+let%test_unit "quickcheck: encode - decode client_request_response" =
+  let test =
+    QCheck.Test.make ~count:1000 ~name:"basic"
+      (QCheck.make Protocol.gen_client_request_response) (fun message ->
+        encode_client_request_response message
+        |> Eio.Flow.string_source
+        |> Eio.Buf_read.of_flow ~max_size:1_000_000_000
+        |> decode_client_request_response = message)
+  in
+  QCheck.Test.check_exn test
 
 let create ~sw ~net ~(config : config) : t =
   let connections = Hashtbl.create 0 in

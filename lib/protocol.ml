@@ -69,3 +69,22 @@ type append_entries_output = {
   replica_id : replica_id;
 }
 [@@deriving show, qcheck]
+
+(* Represents a response to a client request. The response is sent using the callback in `client_request` *)
+type client_request_response =
+  (* The replica is not the leader and doesn't know who the leader is. *)
+  | UnknownLeader
+  (* The replica is not the leader but knows who the leader is. *)
+  | RedirectToLeader of replica_id
+  (* The replica is the leader and has replicated the client entry. *)
+  | ReplicationComplete
+[@@deriving show, qcheck]
+
+(* Represents a request received from a client that believes the replica is the leader. *)
+type client_request = {
+  (* The payload sent by the client. *)
+  payload : string;
+  (* Callback to send a response to the client. *)
+  send_response : client_request_response -> unit;
+}
+[@@deriving show]

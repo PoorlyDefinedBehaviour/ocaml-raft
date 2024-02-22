@@ -36,8 +36,16 @@ let handle_client_conn (replica : Replica.replica) flow addr =
     | Some payload ->
         Replica.handle_message replica
           (Replica.ClientRequest
-             (* TODO: send response to client *)
-             { payload; send_response = (fun _ -> assert false) });
+             {
+               payload;
+               send_response =
+                 (fun response ->
+                   let encoded_message =
+                     Tcp_transport.encode_client_request_response response
+                   in
+                   Eio.Buf_write.with_flow flow (fun to_client ->
+                       Eio.Buf_write.string to_client encoded_message));
+             });
 
         loop ()
   in

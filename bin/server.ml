@@ -1,7 +1,5 @@
 open Eio.Std
 
-let traceln fmt = traceln ("bin/server: " ^^ fmt)
-
 let main ~net ~clock =
   Switch.run ~name:"main" (fun sw ->
       let replica_id =

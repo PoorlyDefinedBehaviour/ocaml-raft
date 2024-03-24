@@ -2,6 +2,12 @@ open Eio.Std
 
 let traceln fmt = traceln ("bin/server: " ^^ fmt)
 
+type set_command = { key : string; value : string } [@@deriving show, yojson]
+
+let json_from_string s =
+  try Ok (Yojson.Safe.from_string s)
+  with exn -> Error (Printexc.to_string exn)
+
 let handler ~replica _socket request body =
   match Http.Request.resource request with
   | "/" -> (
@@ -10,29 +16,36 @@ let handler ~replica _socket request body =
       | `POST -> (
           let flow = Eio.Buf_read.of_flow body ~max_size:1024 in
           let body = Eio.Buf_read.take_all flow in
-          let promise, resolver = Eio.Promise.create () in
-          let () =
-            Raft.Replica.handle_message replica
-              (Raft.Replica.ClientRequest
-                 {
-                   payload = body;
-                   send_response =
-                     (fun response -> Eio.Promise.resolve resolver response);
-                 })
-          in
-          match Eio.Promise.await promise with
-          | Raft.Protocol.UnknownLeader ->
+
+          match Result.bind (json_from_string body) set_command_of_yojson with
+          | Error _ ->
               ( Http.Response.make (),
-                Cohttp_eio.Body.of_string
-                  "Unknown leader. Ensure there's a leader." )
-          | Raft.Protocol.RedirectToLeader leader_id ->
-              ( Http.Response.make (),
-                Cohttp_eio.Body.of_string
-                  (Printf.sprintf
-                     "Not the leader. Send the request to replica %ld" leader_id)
-              )
-          | Raft.Protocol.ReplicationComplete ->
-              (Http.Response.make (), Cohttp_eio.Body.of_string "OK"))
+                Cohttp_eio.Body.of_string "Unexpected request body" )
+          | Ok command -> (
+              let promise, resolver = Eio.Promise.create () in
+              let () =
+                Raft.Replica.handle_message replica
+                  (Raft.Replica.ClientRequest
+                     {
+                       payload =
+                         Raft.Kv.encode_set_command command.key command.value;
+                       send_response =
+                         (fun response -> Eio.Promise.resolve resolver response);
+                     })
+              in
+              match Eio.Promise.await promise with
+              | Raft.Protocol.UnknownLeader ->
+                  ( Http.Response.make (),
+                    Cohttp_eio.Body.of_string
+                      "Unknown leader. Ensure there's a leader." )
+              | Raft.Protocol.RedirectToLeader leader_id ->
+                  ( Http.Response.make (),
+                    Cohttp_eio.Body.of_string
+                      (Printf.sprintf
+                         "Not the leader. Send the request to replica %ld"
+                         leader_id) )
+              | Raft.Protocol.ReplicationComplete ->
+                  (Http.Response.make (), Cohttp_eio.Body.of_string "OK")))
       | _ ->
           ( Http.Response.make (),
             Cohttp_eio.Body.of_string
@@ -65,10 +78,6 @@ let main ~net ~clock =
       let replicas_socket =
         Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:10
           (`Tcp (Eio.Net.Ipaddr.V4.loopback, 8000 + Int32.to_int replica_id))
-      in
-      let clients_socket =
-        Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:10
-          (`Tcp (Eio.Net.Ipaddr.V4.loopback, 9000 + Int32.to_int replica_id))
       in
       let transport =
         Raft.Tcp_transport.create ~sw ~net
@@ -103,7 +112,7 @@ let main ~net ~clock =
       Eio.Fiber.both
         (fun () ->
           Cohttp_eio.Server.run http_server_socket server ~on_error:log_warning)
-        (fun () -> Raft.Server.start ~replicas_socket ~clients_socket ~replica);
+        (fun () -> Raft.Server.start ~replicas_socket ~replica);
       assert false)
 
 let () =

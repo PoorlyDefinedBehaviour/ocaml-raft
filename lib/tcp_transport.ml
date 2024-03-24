@@ -326,21 +326,29 @@ let create ~sw ~net ~(config : config) : t =
   {
     send_request_vote_input =
       (fun replica_id message ->
+        traceln "send_request_vote_input: %s"
+          (Protocol.show_request_vote_input message);
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(Encode.request_vote_input message));
     send_request_vote_output =
       (fun replica_id message ->
+        traceln "send_request_vote_output: %s"
+          (Protocol.show_request_vote_output message);
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(Encode.request_vote_output message));
     send_append_entries_input =
       (fun replica_id message ->
+        traceln "send_append_entries_input: %s"
+          (Protocol.show_append_entries_input message);
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(Encode.append_entries_input message));
     send_append_entries_output =
       (fun replica_id message ->
+        traceln "send_append_entries_output: %s"
+          (Protocol.show_append_entries_output message);
         send ~sw ~net ~connections ~cluster_members:config.cluster_members
           ~replica_id
           ~message:(Encode.append_entries_output message));

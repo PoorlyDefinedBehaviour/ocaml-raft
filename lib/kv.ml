@@ -1,7 +1,6 @@
 type t = { entries : (string, string) Hashtbl.t }
-type set_command = { key : string; value : string } [@@deriving show]
+type set_command = { key : string; value : string } [@@deriving show, qcheck]
 
-(* TODO: test encode and decode *)
 let encode_set_command (key : string) (value : string) : string =
   let buffer = Buffer.create 0 in
   Buffer.add_int32_be buffer (String.length key |> Int32.of_int);
@@ -22,6 +21,15 @@ let create () : t = { entries = Hashtbl.create 0 }
 let apply (kv : t) (entry : Protocol.entry) : unit =
   let command = decode_set_command entry.data in
   Hashtbl.replace kv.entries command.key command.value
+
+let%test_unit "quickcheck: encode_set_command -> decode_set_command" =
+  let test =
+    QCheck.Test.make ~count:1000 ~name:"basic" (QCheck.make gen_set_command)
+      (fun command ->
+        decode_set_command (encode_set_command command.key command.value)
+        = command)
+  in
+  QCheck.Test.check_exn test
 
 let%test_unit "apply" =
   let kv = create () in

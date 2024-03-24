@@ -1,6 +1,8 @@
 open Protocol
 module ReplicaIdSet = Set.Make (Int32)
 
+let traceln fmt = Eio.Std.traceln ("replica: " ^^ fmt)
+
 type election = {
   (* A set containing the id of the replicas that voted for the candidate. *)
   mutable votes_received : ReplicaIdSet.t; [@opaque]
@@ -480,6 +482,7 @@ and handle_heartbeat_timeout_fired (replica : replica) :
       replica.config.cluster_members)
 
 and start_election (replica : replica) : request_vote_input list =
+  traceln "starting election";
   if replica.volatile_state.state = Leader then []
   else (
     (* Start a new term. *)
@@ -539,6 +542,8 @@ and handle_message (replica : replica) (input_message : input_message) =
   Eio.Mutex.use_rw ~protect:true replica.mutex (fun () ->
       match input_message with
       | ClientRequest request -> (
+          traceln "handle_message: client request=%s"
+            (show_client_request request);
           match handle_client_request replica request with
           | NotCurrentLeader None -> request.send_response UnknownLeader
           | NotCurrentLeader (Some leader_id) ->

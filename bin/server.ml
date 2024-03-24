@@ -1,5 +1,47 @@
 open Eio.Std
 
+let traceln fmt = traceln ("bin/server: " ^^ fmt)
+
+let handler ~replica _socket request body =
+  match Http.Request.resource request with
+  | "/" -> (
+      match request.meth with
+      | `GET -> assert false
+      | `POST -> (
+          let flow = Eio.Buf_read.of_flow body ~max_size:1024 in
+          let body = Eio.Buf_read.take_all flow in
+          let promise, resolver = Eio.Promise.create () in
+          let () =
+            Raft.Replica.handle_message replica
+              (Raft.Replica.ClientRequest
+                 {
+                   payload = body;
+                   send_response =
+                     (fun response -> Eio.Promise.resolve resolver response);
+                 })
+          in
+          match Eio.Promise.await promise with
+          | Raft.Protocol.UnknownLeader ->
+              ( Http.Response.make (),
+                Cohttp_eio.Body.of_string
+                  "Unknown leader. Ensure there's a leader." )
+          | Raft.Protocol.RedirectToLeader leader_id ->
+              ( Http.Response.make (),
+                Cohttp_eio.Body.of_string
+                  (Printf.sprintf
+                     "Not the leader. Send the request to replica %ld" leader_id)
+              )
+          | Raft.Protocol.ReplicationComplete ->
+              (Http.Response.make (), Cohttp_eio.Body.of_string "OK"))
+      | _ ->
+          ( Http.Response.make (),
+            Cohttp_eio.Body.of_string
+              (Printf.sprintf "Unexpected HTTP request method: %s"
+                 (Http.Method.to_string request.meth)) ))
+  | _ -> (Http.Response.make ~status:`Not_found (), Cohttp_eio.Body.of_string "")
+
+let log_warning ex = Logs.warn (fun f -> f "%a" Eio.Exn.pp ex)
+
 let main ~net ~clock =
   Switch.run ~name:"main" (fun sw ->
       let replica_id =
@@ -9,6 +51,7 @@ let main ~net ~clock =
               (Invalid_argument "ID env variable must be an int between 0 and 2")
         | Some v -> v |> int_of_string |> Int32.of_int
       in
+      let port = int_of_string (Printf.sprintf "810%ld" replica_id) in
       let random = Raft.Rand.create () in
       let cluster_members = [ 0l; 1l; 2l ] in
       let cluster_members_with_addresses :
@@ -52,7 +95,15 @@ let main ~net ~clock =
           ~initial_state:(storage.initial_state ())
           ~fsm_apply:(Raft.Kv.apply kv)
       in
-      let _ = Raft.Server.start ~replicas_socket ~clients_socket ~replica in
+      traceln "http server listening on port %d" port;
+      let http_server_socket =
+        Eio.Net.listen net ~sw ~backlog:128 ~reuse_addr:true
+          (`Tcp (Eio.Net.Ipaddr.V4.loopback, port))
+      and server = Cohttp_eio.Server.make ~callback:(handler ~replica) () in
+      Eio.Fiber.both
+        (fun () ->
+          Cohttp_eio.Server.run http_server_socket server ~on_error:log_warning)
+        (fun () -> Raft.Server.start ~replicas_socket ~clients_socket ~replica);
       assert false)
 
 let () =

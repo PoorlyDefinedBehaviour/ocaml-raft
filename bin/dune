@@ -1,7 +1,16 @@
 (executables
  (public_names server client)
  (names server client)
- (libraries raft eio eio_main))
+ (libraries
+  raft
+  eio
+  eio_main
+  cohttp-eio
+  http
+  yojson
+  ppx_deriving_yojson.runtime)
+ (preprocess
+  (pps ppx_deriving_yojson)))
 
 (env
  (dev

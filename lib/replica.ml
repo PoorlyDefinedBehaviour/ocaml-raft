@@ -20,6 +20,17 @@ type timeout = {
 
 type range = { min : int; max : int } [@@deriving show]
 
+(* Represents a subset of the response received from a replica after sending an AppendEntries message. *)
+type append_entries_result = {
+  (* True when the AppendEntries message succeed, false otherwise *)
+  success : bool;
+  (* The id of the replica that sent the response to the AppendEntries message. *)
+  replica_id : Protocol.replica_id;
+}
+[@@deriving show]
+
+type request_id = Int64.t [@@deriving show]
+
 type volatile_state = {
   (* If the replica is a leader/candidate/follower *)
   mutable state : Protocol.state;
@@ -37,6 +48,12 @@ type volatile_state = {
   mutable match_index : (Protocol.replica_id, int64) Hashtbl.t; [@opaque]
   (* The id of the latest replica to send a successful append entries request. *)
   mutable current_leader : Protocol.replica_id option;
+  (* The AppendEntries messages waiting for a quorum. *)
+  mutable inflight_append_entries :
+    (request_id * Protocol.term, append_entries_result list) Hashtbl.t;
+      [@opaque]
+      (* The value that will be used as the next request id. Starts at 0. Monotonically increasing. *)
+  mutable next_request_id : request_id;
 }
 [@@deriving show]
 
@@ -310,13 +327,33 @@ let handle_client_request (replica : replica) (request : client_request) :
       { term = replica.persistent_state.current_term; data = request.payload }
     in
     replica.storage.append_entries (replica.storage.last_log_index ()) [ entry ];
-    (* TODO: need to send reply to client when replication is complete *)
+
     SendAppendEntries
       (List.filter_map
          (fun replica_id ->
            if replica_id = replica.config.id then None
            else Some (prepare_append_entries replica ~replica_id))
          replica.config.cluster_members)
+
+let next_request_id (replica : replica) : request_id =
+  let request_id = replica.volatile_state.next_request_id in
+  replica.volatile_state.next_request_id <- Int64.add 1L request_id;
+  request_id
+
+(* Sends an AppendEntries message to the other replicas.
+   Keeps track of the inflight requests. *)
+let send_append_entries (replica : replica)
+    (entries : Protocol.append_entries_input list) : unit =
+  let request_id = next_request_id replica in
+  List.iter
+    (fun (entry : Protocol.append_entries_input) ->
+      replica.transport.send_append_entries_input entry.replica_id entry)
+    entries;
+  (* Add the request to the list of inflight requests to
+     keep track of which replicas have replied to the request. *)
+  let key = (request_id, replica.persistent_state.current_term) in
+  let value = [] in
+  Hashtbl.replace replica.volatile_state.inflight_append_entries key value
 
 let rec handle_request_vote (replica : replica) (message : request_vote_input) :
     request_vote_output =
@@ -548,18 +585,9 @@ and handle_message (replica : replica) (input_message : input_message) =
           | NotCurrentLeader None -> request.send_response UnknownLeader
           | NotCurrentLeader (Some leader_id) ->
               request.send_response (RedirectToLeader leader_id)
-          | SendAppendEntries entries ->
-              List.iter
-                (fun (entry : Protocol.append_entries_input) ->
-                  replica.transport.send_append_entries_input entry.replica_id
-                    entry)
-                entries)
+          | SendAppendEntries entries -> send_append_entries replica entries)
       | HeartbeatTimeoutFired ->
-          List.iter
-            (fun (message : Protocol.append_entries_input) ->
-              replica.transport.send_append_entries_input message.replica_id
-                message)
-            (handle_heartbeat_timeout_fired replica)
+          send_append_entries replica (handle_heartbeat_timeout_fired replica)
       | ElectionTimeoutFired timeout ->
           (* The timeout version will not be current timeout version
              when the election timeout has been reset. *)
@@ -577,10 +605,8 @@ and handle_message (replica : replica) (input_message : input_message) =
             (replica_id_of_input_message input_message)
             output_message
       | RequestVoteOutput message ->
-          handle_request_vote_output replica message
-          |> List.iter (fun (message : Protocol.append_entries_input) ->
-                 replica.transport.send_append_entries_input message.replica_id
-                   message)
+          send_append_entries replica
+            (handle_request_vote_output replica message)
       | AppendEntries message ->
           let output_message = handle_append_entries replica message in
           replica.transport.send_append_entries_output
@@ -590,12 +616,15 @@ and handle_message (replica : replica) (input_message : input_message) =
           match handle_append_entries_output replica message with
           | `Ignore -> ()
           | `ResendAppendEntries ->
-              List.iter
-                (fun replica_id ->
-                  if replica_id <> replica.config.id then
-                    replica.transport.send_append_entries_input replica_id
-                      (prepare_append_entries replica ~replica_id))
-                replica.config.cluster_members))
+              let entries =
+                List.filter_map
+                  (fun replica_id ->
+                    if replica_id <> replica.config.id then
+                      Some (prepare_append_entries replica ~replica_id)
+                    else None)
+                  replica.config.cluster_members
+              in
+              send_append_entries replica entries))
 
 let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : Tcp_transport.t) ~(storage : Disk_storage.t)
@@ -632,6 +661,8 @@ let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
                config.cluster_members;
              hash_table);
           current_leader = None;
+          inflight_append_entries = Hashtbl.create 0;
+          next_request_id = 0L;
         };
       storage;
       transport;
@@ -1178,6 +1209,30 @@ let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
           leader_commit = sut.replica.volatile_state.commit_index;
         };
       ])
+
+let%test_unit "append entries: leader keeps track of inflight requests" =
+  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
+  (* Replica sends AppendEntries message to other replicas.
+     Empty list because we don't care about the messages in this test. *)
+  send_append_entries sut.replica [];
+
+  let key =
+    ( Int64.sub sut.replica.volatile_state.next_request_id 1L,
+      sut.replica.persistent_state.current_term )
+  in
+  (* No responses received yet. *)
+  let responses =
+    Hashtbl.find sut.replica.volatile_state.inflight_append_entries key
+  in
+  assert (responses = []);
+
+  assert (
+    handle_append_entries_output sut.replica
+      { term = 1L; success = true; last_log_index = 1L; replica_id = 2l }
+    = `Ignore);
+
+  (* TODO: continue implementing *)
+  assert false
 
 let%test_unit "append entries: replicas keep track of the current leader. \
                current leader is updated when append entries succeeds" =

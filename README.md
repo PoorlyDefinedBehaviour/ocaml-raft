@@ -38,9 +38,9 @@ curl http://localhost:8102/key
 - After an user request is received and replicated to a quorum, a response must be sent to the client.
 - Check that the replica append one entry to its log when it becomes a leader
 - Use eio in the network and storage layer
-- Persist last applied index to avoid reapplying the whole log
+- Check that data is correctly stored in the state file (look at the file contents and ensure there's nothing weird stored in there)
 - Heartbeat timeout handling. Reset timeout
+- Persist last applied index to avoid reapplying the whole log
 - Handle exceptions
 - Stop using lists
-- Check that data is correctly stored in the state file (look at the file contents and ensure there's nothing weird stored in there)
 - Remove completed todos

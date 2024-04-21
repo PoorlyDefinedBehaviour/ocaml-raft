@@ -41,6 +41,7 @@ type request_vote_output = {
 type entry = { term : term; data : string } [@@deriving show, qcheck]
 
 type append_entries_input = {
+  request_id : int64;
   (* Leader's term *)
   leader_term : term;
   (* So follower can redirect clients *)
@@ -59,6 +60,7 @@ type append_entries_input = {
 [@@deriving show, qcheck]
 
 type append_entries_output = {
+  request_id : int64;
   (* The current term in the replica, for leader to update itself *)
   term : term;
   (* True if follower contained entry matching previous_log_index and previous_log_term *)

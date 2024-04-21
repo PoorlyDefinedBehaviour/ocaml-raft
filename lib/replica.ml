@@ -1,6 +1,13 @@
 open Protocol
 module ReplicaIdSet = Set.Make (Int32)
 
+module AppendEntriesOutputSet = Set.Make (struct
+  type t = Protocol.append_entries_output [@@deriving show]
+
+  let compare = Stdlib.compare
+end)
+[@@deriving show]
+
 let traceln fmt = Eio.Std.traceln ("replica: " ^^ fmt)
 
 type election = {
@@ -50,7 +57,7 @@ type volatile_state = {
   mutable current_leader : Protocol.replica_id option;
   (* The AppendEntries messages waiting for a quorum. *)
   mutable inflight_append_entries :
-    (request_id * Protocol.term, append_entries_result list) Hashtbl.t;
+    (request_id * Protocol.term, AppendEntriesOutputSet.t) Hashtbl.t;
       [@opaque]
       (* The value that will be used as the next request id. Starts at 0. Monotonically increasing. *)
   mutable next_request_id : request_id;
@@ -201,14 +208,23 @@ let commit (replica : replica) : unit =
 (* Handles a response to an append entries message. *)
 let handle_append_entries_output (replica : replica)
     (message : Protocol.append_entries_output) =
+  let key = (message.request_id, message.term) in
+
   if
     message.term <> replica.persistent_state.current_term
     || replica.volatile_state.state <> Leader
   then `Ignore
   else if message.success then (
+    Hashtbl.find_opt replica.volatile_state.inflight_append_entries key
+    |> Option.iter (fun responses ->
+           let new_responses = AppendEntriesOutputSet.add message responses in
+           Hashtbl.replace replica.volatile_state.inflight_append_entries key
+             new_responses);
+
     let current_match_index =
       Hashtbl.find replica.volatile_state.match_index message.replica_id
     in
+
     (* Take the max of the current and the received log index because the message
        may be a response to a request that is not the latest. *)
     Hashtbl.replace replica.volatile_state.match_index message.replica_id
@@ -228,6 +244,8 @@ let handle_append_entries_output (replica : replica)
     let count =
       Hashtbl.create (Hashtbl.length replica.volatile_state.match_index)
     in
+
+    (* TODO: replace this with quorum check *)
 
     (* Count how many replicas have log entries up to the same index. *)
     Hashtbl.iter
@@ -272,6 +290,12 @@ let handle_append_entries_output (replica : replica)
 
     `Ignore)
   else (
+    Hashtbl.find_opt replica.volatile_state.inflight_append_entries key
+    |> Option.iter (fun responses ->
+           let new_responses = AppendEntriesOutputSet.add message responses in
+           Hashtbl.replace replica.volatile_state.inflight_append_entries key
+             new_responses);
+
     (* AppendEntries request failed because the log entries the leader sent did not match the replica's log.
        Update the index of the next log entry to be sent and try again. *)
     Hashtbl.replace replica.volatile_state.next_index message.replica_id
@@ -294,29 +318,56 @@ let random_election_timeout (random : Rand.t) (range : range) (version : int64)
 
   { at = Mtime.of_uint64_ns timeout_ns; version = Int64.add version 1L }
 
-let prepare_append_entries (replica : replica)
-    ~(replica_id : Protocol.replica_id) : Protocol.append_entries_input =
-  let next_index = Hashtbl.find replica.volatile_state.next_index replica_id in
-  let previous_index = Int64.sub 1L next_index in
-  let previous_entry =
-    if previous_index > 0L then replica.storage.entry_at_index previous_index
-    else None
-  in
-  let entries =
-    replica.storage.get_entry_batch ~from_index:next_index
-      ~max_size_bytes:replica.config.append_entries_max_batch_size_in_bytes
-  in
+let next_request_id (replica : replica) : request_id =
+  let request_id = replica.volatile_state.next_request_id in
+  replica.volatile_state.next_request_id <- Int64.add 1L request_id;
+  request_id
 
-  {
-    leader_term = replica.persistent_state.current_term;
-    leader_id = replica.config.id;
-    replica_id;
-    previous_log_index = previous_index;
-    previous_log_term =
-      (match previous_entry with None -> 0L | Some entry -> entry.term);
-    entries;
-    leader_commit = replica.volatile_state.commit_index;
-  }
+let prepare_append_entries (replica : replica) :
+    Protocol.append_entries_input list =
+  let request_id = next_request_id replica in
+
+  (* Add the request to the list of inflight requests to
+     so the replica knows when a quorum has replied and a response
+     can be sent to the client. *)
+  let key = (request_id, replica.persistent_state.current_term) in
+  Hashtbl.replace replica.volatile_state.inflight_append_entries key
+    AppendEntriesOutputSet.empty;
+
+  List.filter_map
+    (fun replica_id ->
+      if replica_id = replica.config.id then None
+      else
+        let next_index =
+          Hashtbl.find replica.volatile_state.next_index replica_id
+        in
+        let previous_index = Int64.sub 1L next_index in
+        let previous_entry =
+          if previous_index > 0L then
+            replica.storage.entry_at_index previous_index
+          else None
+        in
+        let entries =
+          replica.storage.get_entry_batch ~from_index:next_index
+            ~max_size_bytes:
+              replica.config.append_entries_max_batch_size_in_bytes
+        in
+
+        Some
+          {
+            request_id;
+            leader_term = replica.persistent_state.current_term;
+            leader_id = replica.config.id;
+            replica_id;
+            previous_log_index = previous_index;
+            previous_log_term =
+              (match previous_entry with
+              | None -> 0L
+              | Some entry -> entry.term);
+            entries;
+            leader_commit = replica.volatile_state.commit_index;
+          })
+    replica.config.cluster_members
 
 let handle_client_request (replica : replica) (request : client_request) :
     client_request_result =
@@ -327,33 +378,16 @@ let handle_client_request (replica : replica) (request : client_request) :
       { term = replica.persistent_state.current_term; data = request.payload }
     in
     replica.storage.append_entries (replica.storage.last_log_index ()) [ entry ];
-
-    SendAppendEntries
-      (List.filter_map
-         (fun replica_id ->
-           if replica_id = replica.config.id then None
-           else Some (prepare_append_entries replica ~replica_id))
-         replica.config.cluster_members)
-
-let next_request_id (replica : replica) : request_id =
-  let request_id = replica.volatile_state.next_request_id in
-  replica.volatile_state.next_request_id <- Int64.add 1L request_id;
-  request_id
+    SendAppendEntries (prepare_append_entries replica)
 
 (* Sends an AppendEntries message to the other replicas.
    Keeps track of the inflight requests. *)
 let send_append_entries (replica : replica)
     (entries : Protocol.append_entries_input list) : unit =
-  let request_id = next_request_id replica in
   List.iter
     (fun (entry : Protocol.append_entries_input) ->
       replica.transport.send_append_entries_input entry.replica_id entry)
-    entries;
-  (* Add the request to the list of inflight requests to
-     keep track of which replicas have replied to the request. *)
-  let key = (request_id, replica.persistent_state.current_term) in
-  let value = [] in
-  Hashtbl.replace replica.volatile_state.inflight_append_entries key value
+    entries
 
 let rec handle_request_vote (replica : replica) (message : request_vote_input) :
     request_vote_output =
@@ -422,22 +456,7 @@ and handle_request_vote_output (replica : replica)
       (* TODO: commit empty log entry? *)
 
       (* Return heartbeat messages. *)
-      List.filter_map
-        (fun replica_id ->
-          if replica_id <> replica.config.id then
-            Some
-              {
-                leader_term = replica.persistent_state.current_term;
-                leader_id = replica.config.id;
-                replica_id;
-                (* TODO: are previous_log_index and previous_log_term correct here? *)
-                previous_log_index = replica.storage.last_log_index ();
-                previous_log_term = replica.storage.last_log_term ();
-                leader_commit = replica.volatile_state.commit_index;
-                entries = [];
-              }
-          else None)
-        replica.config.cluster_members)
+      prepare_append_entries replica)
     else [])
 
 and handle_append_entries (replica : replica) (message : append_entries_input) :
@@ -456,6 +475,7 @@ and handle_append_entries (replica : replica) (message : append_entries_input) :
        | Some entry -> entry.term <> message.previous_log_term
   then
     {
+      request_id = message.request_id;
       term = replica.persistent_state.current_term;
       success = false;
       (* TODO: return last log index where logs match *)
@@ -484,6 +504,7 @@ and handle_append_entries (replica : replica) (message : append_entries_input) :
     replica.volatile_state.current_leader <- Some message.leader_id;
 
     {
+      request_id = message.request_id;
       term = replica.persistent_state.current_term;
       success = true;
       last_log_index = replica.storage.last_log_index ();
@@ -512,11 +533,7 @@ and handle_heartbeat_timeout_fired (replica : replica) :
   else (
     spawn_heartbeat_timeout_fiber replica;
 
-    List.filter_map
-      (fun replica_id ->
-        if replica_id = replica.config.id then None
-        else Some (prepare_append_entries replica ~replica_id))
-      replica.config.cluster_members)
+    prepare_append_entries replica)
 
 and start_election (replica : replica) : request_vote_input list =
   traceln "starting election";
@@ -616,15 +633,7 @@ and handle_message (replica : replica) (input_message : input_message) =
           match handle_append_entries_output replica message with
           | `Ignore -> ()
           | `ResendAppendEntries ->
-              let entries =
-                List.filter_map
-                  (fun replica_id ->
-                    if replica_id <> replica.config.id then
-                      Some (prepare_append_entries replica ~replica_id)
-                    else None)
-                  replica.config.cluster_members
-              in
-              send_append_entries replica entries))
+              send_append_entries replica (prepare_append_entries replica)))
 
 let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : Tcp_transport.t) ~(storage : Disk_storage.t)
@@ -850,6 +859,7 @@ let%test_unit "handle_client_request: when replica is the leader" =
     = SendAppendEntries
         [
           {
+            request_id = 0L;
             leader_term = 0L;
             leader_id = 0l;
             replica_id = 1l;
@@ -859,6 +869,7 @@ let%test_unit "handle_client_request: when replica is the leader" =
             leader_commit = 0L;
           };
           {
+            request_id = 0L;
             leader_term = 0L;
             leader_id = 0l;
             replica_id = 2l;
@@ -875,6 +886,7 @@ let%test_unit "handle_client_request: when replica is the leader" =
     = SendAppendEntries
         [
           {
+            request_id = 1L;
             Protocol.leader_term = 0L;
             leader_id = 0l;
             replica_id = 1l;
@@ -888,6 +900,7 @@ let%test_unit "handle_client_request: when replica is the leader" =
             leader_commit = 0L;
           };
           {
+            request_id = 1L;
             Protocol.leader_term = 0L;
             leader_id = 0l;
             replica_id = 2l;
@@ -967,6 +980,7 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -976,6 +990,7 @@ let%test_unit "request vote: candidate's last log term is less than replica's \
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = true;
         last_log_index = 1L;
@@ -1000,6 +1015,7 @@ let%test_unit "request vote: same last log term but replica's last log index \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1009,6 +1025,7 @@ let%test_unit "request vote: same last log term but replica's last log index \
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = true;
         last_log_index = 2L;
@@ -1152,6 +1169,7 @@ let%test_unit "request vote output" =
   *)
   let message =
     {
+      request_id = 0L;
       leader_term = sut.replica.persistent_state.current_term;
       leader_id = sut.replica.config.id;
       replica_id = 0l;
@@ -1191,6 +1209,7 @@ let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
     handle_heartbeat_timeout_fired sut.replica
     = [
         {
+          request_id = 0L;
           leader_term = sut.replica.persistent_state.current_term;
           leader_id = sut.replica.config.id;
           replica_id = (List.nth cluster.replicas 1).replica.config.id;
@@ -1200,6 +1219,7 @@ let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
           leader_commit = sut.replica.volatile_state.commit_index;
         };
         {
+          request_id = 0L;
           leader_term = sut.replica.persistent_state.current_term;
           leader_id = sut.replica.config.id;
           replica_id = (List.nth cluster.replicas 2).replica.config.id;
@@ -1211,28 +1231,24 @@ let%test_unit "handle_heartbeat_timeout_fired: when in the leader state, \
       ])
 
 let%test_unit "append entries: leader keeps track of inflight requests" =
-  with_test_replica { current_term = 1L; voted_for = None } @@ fun sut ->
-  (* Replica sends AppendEntries message to other replicas.
-     Empty list because we don't care about the messages in this test. *)
-  send_append_entries sut.replica [];
+  with_test_cluster @@ fun cluster ->
+  let sut = List.hd cluster.replicas in
+  sut.replica.volatile_state.state <- Leader;
 
   let key =
-    ( Int64.sub sut.replica.volatile_state.next_request_id 1L,
+    ( sut.replica.volatile_state.next_request_id,
       sut.replica.persistent_state.current_term )
   in
-  (* No responses received yet. *)
-  let responses =
-    Hashtbl.find sut.replica.volatile_state.inflight_append_entries key
-  in
-  assert (responses = []);
 
   assert (
-    handle_append_entries_output sut.replica
-      { term = 1L; success = true; last_log_index = 1L; replica_id = 2l }
-    = `Ignore);
+    Hashtbl.find_opt sut.replica.volatile_state.inflight_append_entries key
+    = None);
 
-  (* TODO: continue implementing *)
-  assert false
+  send_append_entries sut.replica (prepare_append_entries sut.replica);
+
+  assert (
+    Option.is_some
+      (Hashtbl.find_opt sut.replica.volatile_state.inflight_append_entries key))
 
 let%test_unit "append entries: replicas keep track of the current leader. \
                current leader is updated when append entries succeeds" =
@@ -1244,6 +1260,7 @@ let%test_unit "append entries: replicas keep track of the current leader. \
   let response =
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1263,6 +1280,7 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
   let actual =
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 0L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1275,6 +1293,7 @@ let%test_unit "append entries: message.term < replica.term, reject request" =
   assert (
     actual
     = {
+        request_id = 0L;
         term = 1L;
         success = false;
         last_log_index = 0L;
@@ -1289,6 +1308,7 @@ let%test_unit "append entries: message.previous_log_index > \
   let actual =
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1302,6 +1322,7 @@ let%test_unit "append entries: message.previous_log_index > \
   assert (
     actual
     = {
+        request_id = 0L;
         term = 1L;
         success = false;
         last_log_index = 0L;
@@ -1314,6 +1335,7 @@ let%test_unit "append entries: truncates log in conflict" =
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1328,6 +1350,7 @@ let%test_unit "append entries: truncates log in conflict" =
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = true;
         last_log_index = 3L;
@@ -1338,6 +1361,7 @@ let%test_unit "append entries: truncates log in conflict" =
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 2L;
         leader_id = 2l;
         replica_id = 0l;
@@ -1352,6 +1376,7 @@ let%test_unit "append entries: truncates log in conflict" =
         leader_commit = 1L;
       }
     = {
+        request_id = 0L;
         term = 2L;
         success = true;
         last_log_index = 5L;
@@ -1366,6 +1391,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1375,6 +1401,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = false;
         last_log_index = 0L;
@@ -1385,6 +1412,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1394,6 +1422,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = true;
         last_log_index = 1L;
@@ -1404,6 +1433,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 1L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1413,6 +1443,7 @@ let%test_unit "append entries: log entry at previous_log_index does not match \
         leader_commit = 0L;
       }
     = {
+        request_id = 1L;
         term = 1L;
         success = false;
         last_log_index = 1L;
@@ -1427,6 +1458,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1436,6 +1468,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = true;
         last_log_index = 2L;
@@ -1446,6 +1479,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 1L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1455,6 +1489,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
         leader_commit = 2L;
       }
     = {
+        request_id = 1L;
         term = 1L;
         success = true;
         last_log_index = 3L;
@@ -1470,6 +1505,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 2L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1479,6 +1515,7 @@ let%test_unit "append entries: leader commit index > replica commit index, \
         leader_commit = 3L;
       }
     = {
+        request_id = 2L;
         term = 1L;
         success = true;
         last_log_index = 3L;
@@ -1501,6 +1538,7 @@ let%test_unit "append entries: message term > replica term, update own term \
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 1L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1510,6 +1548,7 @@ let%test_unit "append entries: message term > replica term, update own term \
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = true;
         last_log_index = 1L;
@@ -1538,6 +1577,7 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 0L;
         leader_id = 1l;
         replica_id = 0l;
@@ -1547,6 +1587,7 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 1L;
         success = false;
         last_log_index = 0L;
@@ -1561,6 +1602,7 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
   assert (
     handle_append_entries sut.replica
       {
+        request_id = 0L;
         leader_term = 2L;
         leader_id = 2l;
         replica_id = 0l;
@@ -1570,6 +1612,7 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
         leader_commit = 0L;
       }
     = {
+        request_id = 0L;
         term = 2L;
         success = true;
         last_log_index = 1L;
@@ -1581,6 +1624,46 @@ let%test_unit "append entries: resets election timeout when request succeeds" =
     Int64.add 1L timeout.version
     = sut.replica.volatile_state.next_election_timeout.version)
 
+let%test_unit "append entries output: keeps track of responses to inflight \
+               requests" =
+  with_test_cluster @@ fun cluster ->
+  let sut = List.hd cluster.replicas in
+  sut.replica.volatile_state.state <- Leader;
+  sut.replica.persistent_state.current_term <- 1L;
+
+  let message_success =
+    {
+      request_id = 0L;
+      term = 1L;
+      success = true;
+      last_log_index = 1L;
+      replica_id = 2l;
+    }
+  in
+  let message_failure =
+    {
+      request_id = 0L;
+      term = 1L;
+      success = true;
+      last_log_index = 1L;
+      replica_id = 1l;
+    }
+  in
+
+  let key = (message_success.request_id, message_success.term) in
+  Hashtbl.replace sut.replica.volatile_state.inflight_append_entries key
+    AppendEntriesOutputSet.empty;
+
+  assert (handle_append_entries_output sut.replica message_success = `Ignore);
+  assert (handle_append_entries_output sut.replica message_failure = `Ignore);
+
+  let responses =
+    Hashtbl.find sut.replica.volatile_state.inflight_append_entries key
+  in
+  assert (AppendEntriesOutputSet.cardinal responses = 2);
+  assert (AppendEntriesOutputSet.mem message_success responses);
+  assert (AppendEntriesOutputSet.mem message_failure responses)
+
 let%test_unit "append entries output: message.term <> current term, should \
                ignore message" =
   with_test_replica { current_term = 2L; voted_for = None } @@ fun sut ->
@@ -1588,7 +1671,13 @@ let%test_unit "append entries output: message.term <> current term, should \
 
   assert (
     handle_append_entries_output sut.replica
-      { term = 1L; success = true; last_log_index = 1L; replica_id = 2l }
+      {
+        request_id = 0L;
+        term = 1L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = 2l;
+      }
     = `Ignore)
 
 let%test_unit "append entries output: not in the leader state, should ignore \
@@ -1598,7 +1687,13 @@ let%test_unit "append entries output: not in the leader state, should ignore \
 
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = true; last_log_index = 1L; replica_id = 2l }
+      {
+        request_id = 0L;
+        term = 2L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = 2l;
+      }
     = `Ignore)
 
 let%test_unit "append entries output: log inconsistency, should send append \
@@ -1614,7 +1709,13 @@ let%test_unit "append entries output: log inconsistency, should send append \
      Should send the append entries request again. *)
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = false; last_log_index = 2L; replica_id }
+      {
+        request_id = 0L;
+        term = 2L;
+        success = false;
+        last_log_index = 2L;
+        replica_id;
+      }
     = `ResendAppendEntries);
 
   (*
@@ -1626,7 +1727,13 @@ let%test_unit "append entries output: log inconsistency, should send append \
   (* Same assertions as the ones above but using a different last log index. *)
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = false; last_log_index = 5L; replica_id }
+      {
+        request_id = 0L;
+        term = 2L;
+        success = false;
+        last_log_index = 5L;
+        replica_id;
+      }
     = `ResendAppendEntries);
 
   assert (Hashtbl.find sut.replica.volatile_state.next_index replica_id = 6L)
@@ -1641,7 +1748,13 @@ let%test_unit "append entries output: leader commits entries that are \
   (* Leader has sent entries up to index 3 on this replica. *)
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = true; last_log_index = 3L; replica_id = 1l }
+      {
+        request_id = 0L;
+        term = 2L;
+        success = true;
+        last_log_index = 3L;
+        replica_id = 1l;
+      }
     = `Ignore);
 
   (* Leader should commit up to index 3 because entries are on the leader and on one other replica. *)
@@ -1650,7 +1763,13 @@ let%test_unit "append entries output: leader commits entries that are \
   (* Leader has sent entries up to index 5 on this replica. *)
   assert (
     handle_append_entries_output sut.replica
-      { term = 2L; success = true; last_log_index = 5L; replica_id = 2l }
+      {
+        request_id = 0L;
+        term = 2L;
+        success = true;
+        last_log_index = 5L;
+        replica_id = 2l;
+      }
     = `Ignore);
 
   (* Leader should commit up to index 5 because entries are on the leader and on one other replica. *)

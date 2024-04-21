@@ -68,6 +68,7 @@ module Encode = struct
   let append_entries_input (message : Protocol.append_entries_input) =
     let buffer = Buffer.create 0 in
     Buffer.add_char buffer message_type_append_entries_input;
+    Buffer.add_int64_be buffer message.request_id;
     Buffer.add_int64_be buffer message.leader_term;
     Buffer.add_int32_be buffer message.leader_id;
     Buffer.add_int32_be buffer message.replica_id;
@@ -81,6 +82,7 @@ module Encode = struct
   let append_entries_output (message : Protocol.append_entries_output) =
     let buffer = Buffer.create 0 in
     Buffer.add_char buffer message_type_append_entries_output;
+    Buffer.add_int64_be buffer message.request_id;
     Buffer.add_int64_be buffer message.term;
     Buffer.add_char buffer (bool message.success);
     Buffer.add_int64_be buffer message.last_log_index;
@@ -129,6 +131,7 @@ module Decode = struct
     let message_type = Buf_reader.read_char reader in
     assert (message_type = message_type_append_entries_input);
 
+    let request_id = Buf_reader.read_int64_be reader in
     let leader_term = Buf_reader.read_int64_be reader in
     let leader_id = Buf_reader.read_int32_be reader in
     let replica_id = Buf_reader.read_int32_be reader in
@@ -137,6 +140,7 @@ module Decode = struct
     let entries = read_entries reader in
     let leader_commit = Buf_reader.read_int64_be reader in
     {
+      request_id;
       leader_term;
       leader_id;
       replica_id;
@@ -151,11 +155,12 @@ module Decode = struct
     let message_type = Buf_reader.read_char reader in
     assert (message_type = message_type_append_entries_output);
 
+    let request_id = Buf_reader.read_int64_be reader in
     let term = Buf_reader.read_int64_be reader in
     let success = Buf_reader.read_bool reader in
     let last_log_index = Buf_reader.read_int64_be reader in
     let replica_id = Buf_reader.read_int32_be reader in
-    { term; success; last_log_index; replica_id }
+    { request_id; term; success; last_log_index; replica_id }
 
   let client_request_response (reader : Eio.Buf_read.t) :
       Protocol.client_request_response =

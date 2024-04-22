@@ -168,7 +168,8 @@ let has_voted_for_other_candidate (replica : replica)
 let transition_to_higher_term (replica : replica) (term : term) : unit =
   replica.persistent_state.current_term <- term;
   replica.volatile_state.state <- Follower;
-  replica.persistent_state.voted_for <- None
+  replica.persistent_state.voted_for <- None;
+  replica.volatile_state.inflight_append_entries <- Hashtbl.create 0
 
 let create_next_index_map ~(replica_id : Protocol.replica_id)
     ~(cluster_members : Protocol.replica_id list) ~(last_log_index : int64) :
@@ -208,19 +209,17 @@ let commit (replica : replica) : unit =
 (* Handles a response to an append entries message. *)
 let handle_append_entries_output (replica : replica)
     (message : Protocol.append_entries_output) =
+  let quorum = majority (List.length replica.config.cluster_members) in
   let key = (message.request_id, message.term) in
 
-  if
-    message.term <> replica.persistent_state.current_term
+  if message.term > replica.persistent_state.current_term then (
+    transition_to_higher_term replica message.term;
+    `ReplyFailureToClient message.request_id)
+  else if
+    message.term < replica.persistent_state.current_term
     || replica.volatile_state.state <> Leader
   then `Ignore
   else if message.success then (
-    Hashtbl.find_opt replica.volatile_state.inflight_append_entries key
-    |> Option.iter (fun responses ->
-           let new_responses = AppendEntriesOutputSet.add message responses in
-           Hashtbl.replace replica.volatile_state.inflight_append_entries key
-             new_responses);
-
     let current_match_index =
       Hashtbl.find replica.volatile_state.match_index message.replica_id
     in
@@ -244,8 +243,6 @@ let handle_append_entries_output (replica : replica)
     let count =
       Hashtbl.create (Hashtbl.length replica.volatile_state.match_index)
     in
-
-    (* TODO: replace this with quorum check *)
 
     (* Count how many replicas have log entries up to the same index. *)
     Hashtbl.iter
@@ -273,7 +270,6 @@ let handle_append_entries_output (replica : replica)
 
     let exception Break in
     (try
-       let quorum = majority (List.length replica.config.cluster_members) in
        List.iter
          (fun (index, count) ->
            if index >= low_watermark then (
@@ -288,14 +284,27 @@ let handle_append_entries_output (replica : replica)
     | Break -> ()
     | exn -> raise exn);
 
-    `Ignore)
-  else (
-    Hashtbl.find_opt replica.volatile_state.inflight_append_entries key
-    |> Option.iter (fun responses ->
-           let new_responses = AppendEntriesOutputSet.add message responses in
-           Hashtbl.replace replica.volatile_state.inflight_append_entries key
-             new_responses);
+    match
+      Hashtbl.find_opt replica.volatile_state.inflight_append_entries key
+    with
+    | None -> `Ignore
+    | Some responses ->
+        let new_responses = AppendEntriesOutputSet.add message responses in
+        Hashtbl.replace replica.volatile_state.inflight_append_entries key
+          new_responses;
 
+        let success_count =
+          AppendEntriesOutputSet.cardinal
+            (AppendEntriesOutputSet.filter
+               (fun response -> response.success)
+               new_responses)
+        in
+
+        if success_count >= quorum then (
+          Hashtbl.remove replica.volatile_state.inflight_append_entries key;
+          `ReplySuccessToClient message.request_id)
+        else `Ignore)
+  else (
     (* AppendEntries request failed because the log entries the leader sent did not match the replica's log.
        Update the index of the next log entry to be sent and try again. *)
     Hashtbl.replace replica.volatile_state.next_index message.replica_id
@@ -380,8 +389,7 @@ let handle_client_request (replica : replica) (request : client_request) :
     replica.storage.append_entries (replica.storage.last_log_index ()) [ entry ];
     SendAppendEntries (prepare_append_entries replica)
 
-(* Sends an AppendEntries message to the other replicas.
-   Keeps track of the inflight requests. *)
+(* Sends an AppendEntries message to the other replicas. *)
 let send_append_entries (replica : replica)
     (entries : Protocol.append_entries_input list) : unit =
   List.iter
@@ -633,7 +641,15 @@ and handle_message (replica : replica) (input_message : input_message) =
           match handle_append_entries_output replica message with
           | `Ignore -> ()
           | `ResendAppendEntries ->
-              send_append_entries replica (prepare_append_entries replica)))
+              send_append_entries replica (prepare_append_entries replica)
+          | `ReplySuccessToClient request_id ->
+              Printf.printf
+                "aaaaaaa TODO: reply success to client. request_id=%Ld\n\n"
+                request_id
+          | `ReplyFailureToClient request_id ->
+              Printf.printf
+                "aaaaaaa TODO: reply failure to client. request_id=%Ld\n\n"
+                request_id))
 
 let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : Tcp_transport.t) ~(storage : Disk_storage.t)
@@ -1244,7 +1260,8 @@ let%test_unit "append entries: leader keeps track of inflight requests" =
     Hashtbl.find_opt sut.replica.volatile_state.inflight_append_entries key
     = None);
 
-  send_append_entries sut.replica (prepare_append_entries sut.replica);
+  (* prepare_append_entries adds an entry to the inflight requests. *)
+  let _ = prepare_append_entries sut.replica in
 
   assert (
     Option.is_some
@@ -1631,7 +1648,7 @@ let%test_unit "append entries output: keeps track of responses to inflight \
   sut.replica.volatile_state.state <- Leader;
   sut.replica.persistent_state.current_term <- 1L;
 
-  let message_success =
+  let message =
     {
       request_id = 0L;
       term = 1L;
@@ -1640,31 +1657,60 @@ let%test_unit "append entries output: keeps track of responses to inflight \
       replica_id = 2l;
     }
   in
-  let message_failure =
-    {
-      request_id = 0L;
-      term = 1L;
-      success = true;
-      last_log_index = 1L;
-      replica_id = 1l;
-    }
-  in
 
-  let key = (message_success.request_id, message_success.term) in
+  let key = (message.request_id, message.term) in
   Hashtbl.replace sut.replica.volatile_state.inflight_append_entries key
     AppendEntriesOutputSet.empty;
 
-  assert (handle_append_entries_output sut.replica message_success = `Ignore);
-  assert (handle_append_entries_output sut.replica message_failure = `Ignore);
+  assert (
+    handle_append_entries_output sut.replica
+      {
+        request_id = 0L;
+        term = 1L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = 2l;
+      }
+    = `Ignore);
+  assert (
+    handle_append_entries_output sut.replica
+      {
+        request_id = 0L;
+        term = 1L;
+        success = true;
+        last_log_index = 1L;
+        replica_id = 1l;
+      }
+    = `ReplySuccessToClient 0L);
 
-  let responses =
-    Hashtbl.find sut.replica.volatile_state.inflight_append_entries key
-  in
-  assert (AppendEntriesOutputSet.cardinal responses = 2);
-  assert (AppendEntriesOutputSet.mem message_success responses);
-  assert (AppendEntriesOutputSet.mem message_failure responses)
+  (* Request is not in flight anymore because the majority of replicas have sent a success response. *)
+  assert (
+    Hashtbl.find_opt sut.replica.volatile_state.inflight_append_entries key
+    = None)
 
-let%test_unit "append entries output: message.term <> current term, should \
+let%test_unit "append entries output: message.term > current term, should \
+               transition to follower" =
+  with_test_replica { current_term = 2L; voted_for = None } @@ fun sut ->
+  sut.replica.volatile_state.state <- Leader;
+
+  (* Replica replies to AppendEntries with a higher term. *)
+  assert (
+    handle_append_entries_output sut.replica
+      {
+        request_id = 0L;
+        term = 3L;
+        success = false;
+        last_log_index = 1L;
+        replica_id = 2l;
+      }
+    (* Should reply failure to the client that's waiting for a request to complete if any. *)
+    = `ReplyFailureToClient 0L);
+
+  (* The leader steps down and becoes a follower because it found a replica with a higher term. *)
+  assert (sut.replica.volatile_state.state = Follower);
+  assert (sut.replica.persistent_state.current_term = 3L)
+
+let%test_unit "append entries output: message.term < current term, should \
                ignore message" =
   with_test_replica { current_term = 2L; voted_for = None } @@ fun sut ->
   sut.replica.volatile_state.state <- Leader;

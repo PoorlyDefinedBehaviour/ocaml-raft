@@ -44,3 +44,4 @@ curl http://localhost:8102/key
 - Handle exceptions
 - Stop using lists
 - Remove completed todos
+- Clean up inflight requests, add request queue

@@ -304,7 +304,11 @@ let persist (storage : storage) (state : Protocol.persistent_state) : unit =
       | None -> "-1"
       | Some replica_id -> Int32.to_string replica_id)
   in
+
+  (* TODO: write to other file and rename because writes are not atomic *)
+  (* TODO: fsync folder after file rename *)
   seek_out storage.state_file_out 0;
+
   Out_channel.output_string storage.state_file_out contents;
   Out_channel.flush storage.state_file_out
 
@@ -459,7 +463,19 @@ let%test_unit "persist: stores persistent state on disk" =
   let storage = make { dir = temp_dir } in
   let state = initial_state storage in
 
-  assert (expected = state)
+  assert (expected = state);
+
+  (* Persisting again should overwrite the file contents. *)
+  let new_state : Protocol.persistent_state =
+    { current_term = 2L; voted_for = None }
+  in
+  persist storage new_state;
+  (* Read the state from the file.  *)
+  Printf.printf "aaaaaaa state=%s\n\n"
+    (Protocol.show_initial_state (initial_state storage));
+  assert (
+    initial_state storage
+    = { current_term = new_state.current_term; voted_for = new_state.voted_for })
 
 let%test_unit "last_log_term: returns the term of the last log entry" =
   (* Given an empty log *)

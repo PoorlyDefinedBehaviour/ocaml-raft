@@ -36,7 +36,10 @@ type append_entries_result = {
 }
 [@@deriving show]
 
-type request_id = Int64.t [@@deriving show]
+type inflight_request = {
+  send_response : (Protocol.client_request_response -> unit) option;
+  responses : AppendEntriesOutputSet.t;
+}
 
 type volatile_state = {
   (* If the replica is a leader/candidate/follower *)
@@ -57,10 +60,10 @@ type volatile_state = {
   mutable current_leader : Protocol.replica_id option;
   (* The AppendEntries messages waiting for a quorum. *)
   mutable inflight_append_entries :
-    (request_id * Protocol.term, AppendEntriesOutputSet.t) Hashtbl.t;
+    (request_id * Protocol.term, inflight_request) Hashtbl.t;
       [@opaque]
       (* The value that will be used as the next request id. Starts at 0. Monotonically increasing. *)
-  mutable next_request_id : request_id;
+  mutable next_request_id : Protocol.request_id;
 }
 [@@deriving show]
 
@@ -211,10 +214,16 @@ let handle_append_entries_output (replica : replica)
     (message : Protocol.append_entries_output) =
   let quorum = majority (List.length replica.config.cluster_members) in
   let key = (message.request_id, message.term) in
+  let inflight_request =
+    Hashtbl.find_opt replica.volatile_state.inflight_append_entries key
+  in
 
   if message.term > replica.persistent_state.current_term then (
     transition_to_higher_term replica message.term;
-    `ReplyFailureToClient message.request_id)
+    match inflight_request with
+    | None -> `ReplyFailureToClient None
+    | Some inflight_request ->
+        `ReplyFailureToClient inflight_request.send_response)
   else if
     message.term < replica.persistent_state.current_term
     || replica.volatile_state.state <> Leader
@@ -284,14 +293,14 @@ let handle_append_entries_output (replica : replica)
     | Break -> ()
     | exn -> raise exn);
 
-    match
-      Hashtbl.find_opt replica.volatile_state.inflight_append_entries key
-    with
+    match inflight_request with
     | None -> `Ignore
-    | Some responses ->
-        let new_responses = AppendEntriesOutputSet.add message responses in
+    | Some inflight_request ->
+        let new_responses =
+          AppendEntriesOutputSet.add message inflight_request.responses
+        in
         Hashtbl.replace replica.volatile_state.inflight_append_entries key
-          new_responses;
+          { inflight_request with responses = new_responses };
 
         let success_count =
           AppendEntriesOutputSet.cardinal
@@ -302,7 +311,7 @@ let handle_append_entries_output (replica : replica)
 
         if success_count >= quorum then (
           Hashtbl.remove replica.volatile_state.inflight_append_entries key;
-          `ReplySuccessToClient message.request_id)
+          `ReplySuccessToClient inflight_request.send_response)
         else `Ignore)
   else (
     (* AppendEntries request failed because the log entries the leader sent did not match the replica's log.
@@ -310,7 +319,10 @@ let handle_append_entries_output (replica : replica)
     Hashtbl.replace replica.volatile_state.next_index message.replica_id
       (Int64.add 1L message.last_log_index);
 
-    `ResendAppendEntries)
+    match inflight_request with
+    | None -> `Ignore
+    | Some inflight_request ->
+        `ResendAppendEntries inflight_request.send_response)
 
 (* Returns a timeout with a new version and the timeout time somewhere in the timeout range. *)
 let random_election_timeout (random : Rand.t) (range : range) (version : int64)
@@ -332,8 +344,9 @@ let next_request_id (replica : replica) : request_id =
   replica.volatile_state.next_request_id <- Int64.add 1L request_id;
   request_id
 
-let prepare_append_entries (replica : replica) :
-    Protocol.append_entries_input list =
+let prepare_append_entries
+    ?(send_response : (Protocol.client_request_response -> unit) option)
+    (replica : replica) : Protocol.append_entries_input list =
   let request_id = next_request_id replica in
 
   (* Add the request to the list of inflight requests to
@@ -341,7 +354,7 @@ let prepare_append_entries (replica : replica) :
      can be sent to the client. *)
   let key = (request_id, replica.persistent_state.current_term) in
   Hashtbl.replace replica.volatile_state.inflight_append_entries key
-    AppendEntriesOutputSet.empty;
+    { send_response; responses = AppendEntriesOutputSet.empty };
 
   List.filter_map
     (fun replica_id ->
@@ -640,16 +653,17 @@ and handle_message (replica : replica) (input_message : input_message) =
       | AppendEntriesOutput message -> (
           match handle_append_entries_output replica message with
           | `Ignore -> ()
-          | `ResendAppendEntries ->
-              send_append_entries replica (prepare_append_entries replica)
-          | `ReplySuccessToClient request_id ->
-              Printf.printf
-                "aaaaaaa TODO: reply success to client. request_id=%Ld\n\n"
-                request_id
-          | `ReplyFailureToClient request_id ->
-              Printf.printf
-                "aaaaaaa TODO: reply failure to client. request_id=%Ld\n\n"
-                request_id))
+          | `ResendAppendEntries send_response ->
+              send_append_entries replica
+                (prepare_append_entries ?send_response replica)
+          | `ReplySuccessToClient send_response ->
+              Option.iter
+                (fun send_response -> send_response Protocol.ReplicationSuccess)
+                send_response
+          | `ReplyFailureToClient send_response ->
+              Option.iter
+                (fun send_response -> send_response Protocol.ReplicationFailure)
+                send_response))
 
 let create ~(sw : Eio.Switch.t) ~clock ~(config : config)
     ~(transport : Tcp_transport.t) ~(storage : Disk_storage.t)
@@ -1660,7 +1674,10 @@ let%test_unit "append entries output: keeps track of responses to inflight \
 
   let key = (message.request_id, message.term) in
   Hashtbl.replace sut.replica.volatile_state.inflight_append_entries key
-    AppendEntriesOutputSet.empty;
+    {
+      send_response = Some (fun _ -> ());
+      responses = AppendEntriesOutputSet.empty;
+    };
 
   assert (
     handle_append_entries_output sut.replica
@@ -1673,15 +1690,18 @@ let%test_unit "append entries output: keeps track of responses to inflight \
       }
     = `Ignore);
   assert (
-    handle_append_entries_output sut.replica
-      {
-        request_id = 0L;
-        term = 1L;
-        success = true;
-        last_log_index = 1L;
-        replica_id = 1l;
-      }
-    = `ReplySuccessToClient 0L);
+    match
+      handle_append_entries_output sut.replica
+        {
+          request_id = 0L;
+          term = 1L;
+          success = true;
+          last_log_index = 1L;
+          replica_id = 1l;
+        }
+    with
+    | `ReplySuccessToClient _ -> true
+    | _ -> false);
 
   (* Request is not in flight anymore because the majority of replicas have sent a success response. *)
   assert (
@@ -1695,16 +1715,19 @@ let%test_unit "append entries output: message.term > current term, should \
 
   (* Replica replies to AppendEntries with a higher term. *)
   assert (
-    handle_append_entries_output sut.replica
-      {
-        request_id = 0L;
-        term = 3L;
-        success = false;
-        last_log_index = 1L;
-        replica_id = 2l;
-      }
-    (* Should reply failure to the client that's waiting for a request to complete if any. *)
-    = `ReplyFailureToClient 0L);
+    match
+      handle_append_entries_output sut.replica
+        {
+          request_id = 0L;
+          term = 3L;
+          success = false;
+          last_log_index = 1L;
+          replica_id = 2l;
+        }
+      (* Should reply failure to the client that's waiting for a request to complete if any. *)
+    with
+    | `ReplyFailureToClient _ -> true
+    | _ -> false);
 
   (* The leader steps down and becoes a follower because it found a replica with a higher term. *)
   assert (sut.replica.volatile_state.state = Follower);
@@ -1751,18 +1774,36 @@ let%test_unit "append entries output: log inconsistency, should send append \
 
   let replica_id = 2l in
 
-  (* Leader receives an append entries response for a request that did not succeed.
-     Should send the append entries request again. *)
+  (* Leader receives an append entries response for a request that's not in flight anymore,
+     should ignore the response. *)
   assert (
-    handle_append_entries_output sut.replica
-      {
-        request_id = 0L;
-        term = 2L;
-        success = false;
-        last_log_index = 2L;
-        replica_id;
-      }
-    = `ResendAppendEntries);
+    match
+      handle_append_entries_output sut.replica
+        {
+          request_id = 0L;
+          term = 2L;
+          success = false;
+          last_log_index = 2L;
+          replica_id;
+        }
+    with
+    | `Ignore -> true
+    | _ -> false);
+
+  (* Leader receives an append entries response that didn't succeed because the follower does not have the
+     log entries the leader thinks it has, should resend *)
+  let message =
+    {
+      request_id = 1L;
+      term = 2L;
+      success = false;
+      last_log_index = 5L;
+      replica_id;
+    }
+  in
+  Hashtbl.replace sut.replica.volatile_state.inflight_append_entries
+    (message.request_id, sut.replica.persistent_state.current_term)
+    { send_response = None; responses = AppendEntriesOutputSet.empty };
 
   (*
     The response says that the last log index at the replica is 2.
@@ -1772,15 +1813,9 @@ let%test_unit "append entries output: log inconsistency, should send append \
 
   (* Same assertions as the ones above but using a different last log index. *)
   assert (
-    handle_append_entries_output sut.replica
-      {
-        request_id = 0L;
-        term = 2L;
-        success = false;
-        last_log_index = 5L;
-        replica_id;
-      }
-    = `ResendAppendEntries);
+    match handle_append_entries_output sut.replica message with
+    | `ResendAppendEntries _ -> true
+    | _ -> false);
 
   assert (Hashtbl.find sut.replica.volatile_state.next_index replica_id = 6L)
 

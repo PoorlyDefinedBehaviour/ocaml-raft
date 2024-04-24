@@ -1,8 +1,9 @@
 type replica_id = int32 [@@deriving show, qcheck]
 type term = int64 [@@deriving show, qcheck]
+type request_id = int64 [@@deriving show, qcheck]
 
 type persistent_state = {
-  (* The latest term the server has seen. Initialized to 0 on first boot. Monotonically increasing.   *)
+  (* The latest term the server has seen. Initialized to 0 on first boot. Monotonically increasing. *)
   mutable current_term : int64;
   (* Replica that received the vote in the current term *)
   mutable voted_for : replica_id option;
@@ -29,7 +30,7 @@ type initial_state = { current_term : term; voted_for : replica_id option }
 [@@deriving show, qcheck]
 
 type request_vote_output = {
-  (* The current term in the replica that received the request vote request *)
+  (* The current term in the replica that received the message requesting a vote. *)
   term : term;
   (* The replica that sent the message *)
   replica_id : replica_id;
@@ -41,7 +42,7 @@ type request_vote_output = {
 type entry = { term : term; data : string } [@@deriving show, qcheck]
 
 type append_entries_input = {
-  request_id : int64;
+  request_id : request_id;
   (* Leader's term *)
   leader_term : term;
   (* So follower can redirect clients *)
@@ -60,7 +61,7 @@ type append_entries_input = {
 [@@deriving show, qcheck]
 
 type append_entries_output = {
-  request_id : int64;
+  request_id : request_id;
   (* The current term in the replica, for leader to update itself *)
   term : term;
   (* True if follower contained entry matching previous_log_index and previous_log_term *)
@@ -79,7 +80,9 @@ type client_request_response =
   (* The replica is not the leader but knows who the leader is. *)
   | RedirectToLeader of replica_id
   (* The replica is the leader and has replicated the client entry. *)
-  | ReplicationComplete
+  | ReplicationSuccess
+  (* The replica is the leader and was unable to replicate the client entry. *)
+  | ReplicationFailure
 [@@deriving show, qcheck]
 
 (* Represents a request received from a client that believes the replica is the leader. *)

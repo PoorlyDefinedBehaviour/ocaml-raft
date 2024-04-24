@@ -6,6 +6,7 @@ let message_type_append_entries_output = '4'
 let message_type_client_request_response_unknown_leader = '5'
 let message_type_client_request_response_redirect_to_leader = '6'
 let message_type_client_request_response_success = '7'
+let message_type_client_request_response_failure = '8'
 
 type t = {
   (* Sends a request vote request to the replica. *)
@@ -173,7 +174,9 @@ module Decode = struct
       let leader_id = Buf_reader.read_int32_be reader in
       Protocol.RedirectToLeader leader_id
     else if message_type = message_type_client_request_response_success then
-      Protocol.ReplicationComplete
+      Protocol.ReplicationSuccess
+    else if message_type = message_type_client_request_response_failure then
+      Protocol.ReplicationFailure
     else
       raise
         (Invalid_argument
@@ -311,8 +314,10 @@ let encode_client_request_response (response : Protocol.client_request_response)
       Buffer.add_char buffer
         message_type_client_request_response_redirect_to_leader;
       Buffer.add_int32_be buffer leader_id
-  | ReplicationComplete ->
-      Buffer.add_char buffer message_type_client_request_response_success);
+  | ReplicationSuccess ->
+      Buffer.add_char buffer message_type_client_request_response_success
+  | ReplicationFailure ->
+      Buffer.add_char buffer message_type_client_request_response_failure);
   Buffer.contents buffer
 
 let%test_unit "quickcheck: encode - decode client_request_response" =

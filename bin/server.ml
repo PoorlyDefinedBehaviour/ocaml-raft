@@ -44,8 +44,12 @@ let handler ~replica _socket request body =
                       (Printf.sprintf
                          "Not the leader. Send the request to replica %ld"
                          leader_id) )
-              | Raft.Protocol.ReplicationComplete ->
-                  (Http.Response.make (), Cohttp_eio.Body.of_string "OK")))
+              | Raft.Protocol.ReplicationSuccess ->
+                  (Http.Response.make (), Cohttp_eio.Body.of_string "OK.")
+              | Raft.Protocol.ReplicationFailure ->
+                  ( Http.Response.make (),
+                    Cohttp_eio.Body.of_string
+                      "Unable to replicate to majority of replicas" )))
       | _ ->
           ( Http.Response.make (),
             Cohttp_eio.Body.of_string

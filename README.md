@@ -1,6 +1,6 @@
 ## About
 
-Distributed key value store built on top of a Raft implementation with [eio](https://github.com/ocaml-multicore/eio) from scratch.  I started working on this to practice OCaml while interviewing for an OCaml role. I'll stop working on it as soon as I lose interest.
+Distributed key value store built on top of a Raft implementation with [eio](https://github.com/ocaml-multicore/eio) from scratch.  I started working on this to practice OCaml. I'll stop working on it as soon as I lose interest.
 
 ## Running locally
 
